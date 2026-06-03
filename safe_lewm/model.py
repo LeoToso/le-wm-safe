@@ -34,6 +34,7 @@ class SafeJEPA(nn.Module):
             input_dim=cfg.z_dim,
             hidden_dim=cfg.hidden_dim,
             output_dim=cfg.z_dim,
+            cond_dim=cfg.action_emb_dim,
         )
 
         self.transition_model = TransitionModel(cfg.z_dim, cfg.action_dim, cfg.trans_hidden)

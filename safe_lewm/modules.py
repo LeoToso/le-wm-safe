@@ -247,10 +247,17 @@ class ARPredictor(nn.Module):
         dim_head=64,
         dropout=0.0,
         emb_dropout=0.0,
+        cond_dim=None,
     ):
         super().__init__()
         self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
         self.dropout = nn.Dropout(emb_dropout)
+        # If cond_dim differs from hidden_dim, add explicit projection
+        self.cond_proj = (
+            nn.Linear(cond_dim, hidden_dim)
+            if (cond_dim is not None and cond_dim != hidden_dim)
+            else nn.Identity()
+        )
         self.transformer = Transformer(
             input_dim,
             hidden_dim,
@@ -271,6 +278,7 @@ class ARPredictor(nn.Module):
         T = x.size(1)
         x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
+        c = self.cond_proj(c)
         x = self.transformer(x, c)
         return x
 
