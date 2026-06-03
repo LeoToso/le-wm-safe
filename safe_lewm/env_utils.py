@@ -64,16 +64,27 @@ class SafetyGymWrapper:
         return self.env.action_space
 
 
-def collect_dataset(cfg, seed=42):
-    """Collect offline dataset using random policy with heuristic goal bias."""
-    import pickle
+def collect_dataset(cfg, seed=42, save_every=100):
+    """Collect offline dataset using random policy. Saves incrementally every save_every episodes."""
+    import pickle, sys
     from pathlib import Path
 
+    Path(cfg.data_path).parent.mkdir(parents=True, exist_ok=True)
     env = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed)
-    trajectories = []
 
-    print(f"Collecting {cfg.num_episodes} episodes...")
-    for ep in range(cfg.num_episodes):
+    # Load existing progress if any
+    if Path(cfg.data_path).exists():
+        with open(cfg.data_path, "rb") as f:
+            trajectories = pickle.load(f)
+        start_ep = len(trajectories)
+        print(f"Resuming from episode {start_ep}/{cfg.num_episodes}", flush=True)
+    else:
+        trajectories = []
+        start_ep = 0
+
+    print(f"Collecting {cfg.num_episodes - start_ep} episodes...", flush=True)
+
+    for ep in range(start_ep, cfg.num_episodes):
         obs = env.reset()
         traj = {"obs": [], "action": [], "reward": [], "cost": [], "next_obs": []}
 
@@ -95,11 +106,14 @@ def collect_dataset(cfg, seed=42):
             traj[k] = np.array(traj[k])
         trajectories.append(traj)
 
-        if (ep + 1) % 100 == 0:
-            print(f"  Episode {ep+1}/{cfg.num_episodes}")
+        if (ep + 1) % save_every == 0:
+            with open(cfg.data_path, "wb") as f:
+                pickle.dump(trajectories, f)
+            print(f"  Episode {ep+1}/{cfg.num_episodes} — saved checkpoint", flush=True)
+            sys.stdout.flush()
 
-    Path(cfg.data_path).parent.mkdir(parents=True, exist_ok=True)
+    # Final save
     with open(cfg.data_path, "wb") as f:
         pickle.dump(trajectories, f)
-    print(f"Saved dataset to {cfg.data_path}")
+    print(f"Done. Saved {len(trajectories)} trajectories to {cfg.data_path}", flush=True)
     return trajectories
