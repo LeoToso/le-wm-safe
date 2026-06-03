@@ -1,4 +1,3 @@
-import gymnasium as gym
 import safety_gymnasium
 import numpy as np
 from collections import deque
@@ -8,7 +7,9 @@ class SafetyGymWrapper:
     """Wraps Safety Gym env to return stacked 64x64 RGB pixel observations."""
 
     def __init__(self, env_name, image_size=64, frame_stack=4, frame_skip=2, seed=0):
-        self.env = gym.make(env_name, render_mode="rgb_array", disable_env_checker=True)
+        # Use safety_gymnasium.make directly to avoid gymnasium wrapper conflicts
+        # (gymnasium wrappers expect 5-tuple but safety-gymnasium returns 6-tuple)
+        self.env = safety_gymnasium.make(env_name, render_mode="rgb_array")
         self.image_size = image_size
         self.frame_stack = frame_stack
         self.frame_skip = frame_skip
