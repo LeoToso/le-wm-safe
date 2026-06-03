@@ -41,8 +41,14 @@ class SafetyGymWrapper:
         total_reward = 0.0
         total_cost = 0.0
         for _ in range(self.frame_skip):
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            cost = info.get("cost", 0.0)
+            result = self.env.step(action)
+            # safety-gymnasium returns (obs, reward, cost, terminated, truncated, info)
+            # standard gymnasium returns (obs, reward, terminated, truncated, info)
+            if len(result) == 6:
+                obs, reward, cost, terminated, truncated, info = result
+            else:
+                obs, reward, terminated, truncated, info = result
+                cost = info.get("cost", 0.0)
             total_reward += reward
             total_cost += cost
             if terminated or truncated:
