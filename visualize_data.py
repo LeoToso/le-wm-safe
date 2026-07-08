@@ -1,13 +1,12 @@
 """Visualize the collected Safety Gym dataset."""
-import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 DATA_PATH = "data/safety_point_goal.pkl"
 
-with open(DATA_PATH, "rb") as f:
-    trajs = pickle.load(f)
+from safe_lewm.dataset import load_trajectories
+trajs = load_trajectories(DATA_PATH)
 
 print(f"Loaded {len(trajs)} trajectories")
 print(f"Obs shape per traj: {trajs[0]['obs'].shape}")   # (T, 12, 64, 64)
