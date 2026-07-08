@@ -65,25 +65,31 @@ class SafetyGymWrapper:
 
 
 def collect_dataset(cfg, seed=42, save_every=100):
-    """Collect offline dataset using random policy. Saves incrementally every save_every episodes."""
-    import pickle, sys
+    """Collect offline dataset. Saves one file per checkpoint to avoid corruption on crash."""
+    import pickle, sys, glob
     from pathlib import Path
 
-    Path(cfg.data_path).parent.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(cfg.data_path).parent
+    data_dir.mkdir(parents=True, exist_ok=True)
     env = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed)
 
-    # Load existing progress if any
-    if Path(cfg.data_path).exists():
-        with open(cfg.data_path, "rb") as f:
-            trajectories = pickle.load(f)
-        start_ep = len(trajectories)
+    # Find highest valid checkpoint already saved
+    ckpt_files = sorted(glob.glob(str(data_dir / "chunk_*.pkl")))
+    trajectories = []
+    for ckpt in ckpt_files:
+        try:
+            with open(ckpt, "rb") as f:
+                chunk = pickle.load(f)
+            trajectories.extend(chunk)
+        except Exception:
+            print(f"  Warning: could not load {ckpt}, skipping", flush=True)
+    start_ep = len(trajectories)
+    if start_ep > 0:
         print(f"Resuming from episode {start_ep}/{cfg.num_episodes}", flush=True)
-    else:
-        trajectories = []
-        start_ep = 0
 
     print(f"Collecting {cfg.num_episodes - start_ep} episodes...", flush=True)
 
+    chunk = []
     for ep in range(start_ep, cfg.num_episodes):
         obs = env.reset()
         traj = {"obs": [], "action": [], "reward": [], "cost": [], "next_obs": []}
@@ -91,28 +97,36 @@ def collect_dataset(cfg, seed=42, save_every=100):
         for step in range(cfg.episode_length):
             action = env.action_space.sample()
             next_obs, reward, cost, done, info = env.step(action)
-
             traj["obs"].append(obs.copy())
             traj["action"].append(action.copy())
             traj["reward"].append(reward)
             traj["cost"].append(cost)
             traj["next_obs"].append(next_obs.copy())
-
             obs = next_obs
             if done:
                 break
 
         for k in traj:
             traj[k] = np.array(traj[k])
+        chunk.append(traj)
         trajectories.append(traj)
 
         if (ep + 1) % save_every == 0:
-            with open(cfg.data_path, "wb") as f:
-                pickle.dump(trajectories, f)
-            print(f"  Episode {ep+1}/{cfg.num_episodes} — saved checkpoint", flush=True)
+            # Save this chunk to its own file — never overwrites previous chunks
+            chunk_path = data_dir / f"chunk_{ep+1:05d}.pkl"
+            with open(chunk_path, "wb") as f:
+                pickle.dump(chunk, f)
+            chunk = []
+            print(f"  Episode {ep+1}/{cfg.num_episodes} — saved {chunk_path.name}", flush=True)
             sys.stdout.flush()
 
-    # Final save
+    # Save any remaining episodes
+    if chunk:
+        chunk_path = data_dir / f"chunk_{cfg.num_episodes:05d}_final.pkl"
+        with open(chunk_path, "wb") as f:
+            pickle.dump(chunk, f)
+
+    # Merge all chunks into the main data file
     with open(cfg.data_path, "wb") as f:
         pickle.dump(trajectories, f)
     print(f"Done. Saved {len(trajectories)} trajectories to {cfg.data_path}", flush=True)
