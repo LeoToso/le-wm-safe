@@ -9,13 +9,16 @@ def w2_diagonal(mu1, sigma1, mu2, sigma2):
 
 def bisimulation_loss(z, rewards, costs, transition_model, actions, rho=0.1, gamma=0.99):
     """
+    Safety-only bisimulation: target = rho * |c_i - c_j|
+
+    Only the safety cost term is kept — reward and next-state distribution
+    (W2) terms are disabled. This forces the encoder to separate safe from
+    unsafe states while remaining agnostic to reward structure.
+
     z: (B, D) embeddings
-    rewards: (B,) reward scalars
     costs: (B,) cost scalars
-    transition_model: outputs (mean, log_std) given (z, a)
-    actions: (B, A)
-    rho: cost weight
-    gamma: discount
+    rho: scales the safety separation
+    rewards, transition_model, actions, gamma: unused, kept for API compatibility
     """
     B = z.shape[0]
     idx = torch.randperm(B, device=z.device)
@@ -24,25 +27,13 @@ def bisimulation_loss(z, rewards, costs, transition_model, actions, rho=0.1, gam
     j_idx = idx[half: half * 2]
 
     z_i, z_j = z[i_idx], z[j_idx]
-    r_i, r_j = rewards[i_idx], rewards[j_idx]
     c_i, c_j = costs[i_idx], costs[j_idx]
-    a_i, a_j = actions[i_idx], actions[j_idx]
 
-    # Latent distance (L1): gradients flow through encoder
+    # Latent L1 distance — gradients flow through encoder
     latent_dist = (z_i - z_j).abs().sum(-1)  # (B//2,)
 
-    # Transition model — DETACH for target computation
-    with torch.no_grad():
-        mu_i, log_std_i = transition_model(z_i.detach(), a_i)
-        mu_j, log_std_j = transition_model(z_j.detach(), a_j)
-        sigma_i = log_std_i.exp()
-        sigma_j = log_std_j.exp()
-        w2_sq = w2_diagonal(mu_i, sigma_i, mu_j, sigma_j)
-        w2_dist = w2_sq.sqrt().clamp(min=0)
-
-    # Target (stop-gradient)
-    target = (r_i - r_j).abs() + rho * (c_i - c_j).abs() + gamma * w2_dist
-    target = target.detach()
+    # Safety-only target (stop-gradient)
+    target = (rho * (c_i - c_j).abs()).detach()
 
     loss = 0.5 * (latent_dist - target).pow(2).mean()
     return loss
