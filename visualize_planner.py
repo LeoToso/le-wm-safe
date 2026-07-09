@@ -56,33 +56,37 @@ def denorm(frame_chw):
     f = frame_chw * IMAGENET_STD[:, None, None] + IMAGENET_MEAN[:, None, None]
     return (f.clip(0, 1).transpose(1, 2, 0) * 255).astype(np.uint8)
 
-def world_to_pixel(world_xyz, mj_model, mj_data, cam_id, width, height):
-    """Project a 3-D world point to pixel coordinates using the MuJoCo camera."""
-    import mujoco
-    cam_pos = mj_data.cam_xpos[cam_id].copy()
-    cam_mat = mj_data.cam_xmat[cam_id].reshape(3, 3).copy()
-    fovy    = mj_model.cam_fovy[cam_id]
-    f       = height / (2.0 * np.tan(np.radians(fovy / 2.0)))
-    # Transform world point into camera frame (MuJoCo: camera looks along -z)
-    p_cam = cam_mat.T @ (np.array(world_xyz, dtype=float) - cam_pos)
-    if p_cam[2] >= -1e-4:          # behind or on camera
-        return None
-    px = int( f * p_cam[0] / (-p_cam[2]) + width  / 2)
-    py = int(-f * p_cam[1] / (-p_cam[2]) + height / 2)
+def world_to_pixel(world_xy, width=256, height=256):
+    """
+    Project world (x, y) ground-plane coordinates to pixel (px, py).
+
+    Calibrated for the 'fixedfar' camera:
+      pos="0 -5 5", zaxis="0 -1 1"  (45-degree diagonal, looking at origin)
+
+    The arena spans roughly ±5m in x and ±5m in y.
+    At ground level (z=0):
+      - world_x → pixel_x  (camera x-axis is aligned with world x)
+      - world_y → pixel_y  (foreshortened by cos45 due to 45° tilt)
+    Empirical scale: ~22 px/m for x, ~15 px/m for y (foreshortened).
+    Origin maps to image center.
+    """
+    cx, cy = width / 2, height / 2
+    scale_x = 22.0   # px per metre, horizontal
+    scale_y = 15.0   # px per metre, vertical (foreshortened at 45°)
+    px = int(cx + scale_x * world_xy[0])
+    py = int(cy - scale_y * world_xy[1])   # y flipped (world +y = image up)
     return px, py
 
 
 def draw_marker(frame, px, py, color, label, radius=8):
-    """Draw a filled circle + label at pixel (px, py)."""
+    """Draw a filled circle + white outline + label at pixel (px, py)."""
     import cv2
-    if px is None:
-        return frame
     H, W = frame.shape[:2]
     if 0 <= px < W and 0 <= py < H:
-        cv2.circle(frame, (px, py), radius, color, -1)
-        cv2.circle(frame, (px, py), radius, (255,255,255), 1)
+        cv2.circle(frame, (px, py), radius,     color,       -1)
+        cv2.circle(frame, (px, py), radius + 1, (255,255,255), 1)
         cv2.putText(frame, label, (px + radius + 2, py + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     return frame
 
 # ── Load model ─────────────────────────────────────────────────────────────────
@@ -179,23 +183,17 @@ def mppi_step(z_hist_deque, U_warm, goal_dir_action):
 
 
 def make_viz_env(seed):
-    """Separate high-res env with fixedfar++ overhead camera for recording GIFs."""
+    """Separate high-res env with fixedfar overhead camera for recording GIFs."""
     import safety_gymnasium
     viz = safety_gymnasium.make(
         cfg.env_name,
         render_mode="rgb_array",
-        camera_name="fixedfar++",
+        camera_name="fixedfar",
         width=256,
         height=256,
     )
     viz.reset(seed=seed)
     return viz
-
-
-def get_cam_id(mj_model, cam_name):
-    """Return camera integer id by name."""
-    import mujoco
-    return mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
 
 
 def run_episode(env, use_planner=False, seed=SEED):
@@ -231,18 +229,19 @@ def run_episode(env, use_planner=False, seed=SEED):
     except Exception as e:
         print(f"  Note: could not move goal ({e}), using default position")
 
-    # Record start position and goal position once (they're fixed per episode)
+    # Record start and goal world positions once (fixed per episode)
     try:
         u = env.env.unwrapped
-        start_pos = np.array(u.agent.pos[:2].tolist() + [0.1])   # (x, y, z=0.1)
-        goal_pos  = np.array(u.task.goal.pos[:2].tolist() + [0.1])
-        mj_model  = viz_env.unwrapped.model
-        mj_data   = viz_env.unwrapped.data
-        cam_id    = get_cam_id(mj_model, "fixedfar++")
-        has_proj  = True
+        start_xy = np.array(u.agent.pos[:2])
+        goal_xy  = np.array(u.task.goal.pos[:2])
+        start_px = world_to_pixel(start_xy)
+        goal_px  = world_to_pixel(goal_xy)
+        has_markers = True
+        print(f"  Start world=({start_xy[0]:.2f},{start_xy[1]:.2f}) px={start_px}")
+        print(f"  Goal  world=({goal_xy[0]:.2f},{goal_xy[1]:.2f}) px={goal_px}")
     except Exception as e:
-        print(f"  Warning: could not get positions for markers ({e})")
-        has_proj  = False
+        print(f"  Warning: could not get marker positions ({e})")
+        has_markers = False
 
     for step in range(MAX_STEPS):
         # Current safety score and goal direction
@@ -256,15 +255,10 @@ def run_episode(env, use_planner=False, seed=SEED):
             import cv2
             frame = raw_viz.copy()
 
-            # Draw start marker (yellow ★) and goal marker (cyan ●)
-            if has_proj:
-                mj_data = viz_env.unwrapped.data   # update each step (camera may move)
-                sp = world_to_pixel(start_pos, mj_model, mj_data, cam_id, 256, 256)
-                gp = world_to_pixel(goal_pos,  mj_model, mj_data, cam_id, 256, 256)
-                draw_marker(frame, sp[0] if sp else None, sp[1] if sp else None,
-                            (0, 220, 255), "START", radius=7)
-                draw_marker(frame, gp[0] if gp else None, gp[1] if gp else None,
-                            (255, 220, 0), "GOAL",  radius=9)
+            # Draw start (cyan) and goal (yellow) markers
+            if has_markers:
+                draw_marker(frame, start_px[0], start_px[1], (0, 220, 255), "START", radius=7)
+                draw_marker(frame, goal_px[0],  goal_px[1],  (0, 220, 100), "GOAL",  radius=9)
 
             safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
             color = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
