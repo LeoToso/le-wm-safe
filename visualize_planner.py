@@ -35,7 +35,7 @@ N_SAMPLES     = int(os.environ.get("N_SAMPLES",  "64"))
 HORIZON       = int(os.environ.get("HORIZON",    "5"))
 TEMPERATURE   = float(os.environ.get("TEMPERATURE", "0.05"))
 SAFETY_W      = float(os.environ.get("SAFETY_W",    "20.0"))
-SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.5"))
+SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","1.5"))
 HISTORY       = int(os.environ.get("HISTORY",    "3"))
 SEED          = int(os.environ.get("SEED",       "0"))
 N_SEARCH      = int(os.environ.get("N_SEARCH",   "15"))
@@ -161,13 +161,14 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action):
     goal_t = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
     z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)  # (1, H, D)
 
-    # ── Step 1: one-step look-ahead safety check ──────────────────────────────
-    a_goal = goal_t.clamp(-1, 1).unsqueeze(0).unsqueeze(0)        # (1, 1, A)
-    z_next = model.rollout(z_hist, a_goal, HISTORY)[:, -1, :]     # (1, D)
-    z_next_n = (z_next - z_mean) / z_std
-    next_score = clf(z_next_n).item()
+    # ── Step 1: full-horizon look-ahead safety check ──────────────────────────
+    # Repeat goal action for entire HORIZON and check that all predicted states are safe
+    a_goal_seq = goal_t.clamp(-1, 1).unsqueeze(0).unsqueeze(0).expand(1, HORIZON, -1)
+    z_pred_seq = model.rollout(z_hist, a_goal_seq, HISTORY)[:, -HORIZON:, :]  # (1, H, D)
+    z_pred_n   = (z_pred_seq.squeeze(0) - z_mean) / z_std  # (H, D)
+    min_score  = clf(z_pred_n).min().item()
 
-    if next_score >= safe_threshold + SAFETY_MARGIN:
+    if min_score >= safe_threshold + SAFETY_MARGIN:
         # Predicted safe: go straight to goal — fast, no MPPI needed
         return goal_t.clamp(-1, 1), U_warm
 
@@ -314,24 +315,29 @@ best_goal_dist = 0.0
 for trial_seed in range(SEED, SEED + N_SEARCH):
     env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                                   cfg.frame_skip, seed=trial_seed)
-    # Check initial goal distance before running full episode
+    # Check initial goal distance and current safety score before running full episode
     env_trial.reset()
     _, _, init_dist = get_agent_goal_pos(env_trial.env)
-    print(f"  seed={trial_seed}: initial goal_dist={init_dist:.2f}m", end="")
+    z0_check = get_z(env_trial._get_stacked_obs() if hasattr(env_trial, '_get_stacked_obs') else env_trial.reset())
+    init_safety = get_safety_score(z0_check)
+    print(f"  seed={trial_seed}: goal_dist={init_dist:.2f}m, init_safety={init_safety:.2f}", end="")
 
     trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False, seed=trial_seed)
     total = int(trial_costs.sum())
     print(f" -> random cost={total}")
 
-    # Prefer seeds with high cost AND far initial goal
-    score = total * 2 + (init_dist > 2.5)
-    if score > best_cost * 2 + (best_goal_dist > 2.5):
+    # Prefer seeds where: random hits hazards, goal starts far, agent doesn't spawn IN a hazard
+    starts_safe = init_safety > 1.0    # agent spawns away from hazards
+    starts_far  = init_dist  > 2.5     # goal is not immediately next to agent
+    rank = total * 2 + starts_far + starts_safe
+    best_rank = best_cost * 2 + (best_goal_dist > 2.5) + 1
+    if rank > best_rank or best_rnd is None:
         best_cost      = total
         best_seed      = trial_seed
         best_rnd       = (trial_frames, trial_costs, trial_scores)
         best_goal_dist = init_dist
 
-    if best_cost >= 3 and best_goal_dist > 2.0:
+    if best_cost >= 5 and starts_far and starts_safe:
         break
 
 if best_rnd is None:
