@@ -30,7 +30,7 @@ from safe_lewm.env_utils import SafetyGymWrapper
 CHECKPOINT    = os.environ.get("CHECKPOINT",  "/mnt/t7shield/safe_lewm_rho1.pt")
 CLF_PATH      = os.environ.get("CLF_PATH",    "/mnt/t7shield/classifier.pt")
 OUT_DIR       = Path(os.environ.get("OUT_DIR", "planner_viz"))
-MAX_STEPS     = int(os.environ.get("MAX_STEPS",  "200"))
+MAX_STEPS     = int(os.environ.get("MAX_STEPS",  "500"))
 N_SAMPLES     = int(os.environ.get("N_SAMPLES",  "64"))
 HORIZON       = int(os.environ.get("HORIZON",    "5"))
 TEMPERATURE   = float(os.environ.get("TEMPERATURE", "0.05"))
