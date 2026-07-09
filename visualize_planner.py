@@ -7,9 +7,6 @@ Records pixel frames from the live environment and saves:
   - mppi_traj.gif    : MPPI planner alone
   - comparison.png   : cost & safety score over time
 
-Speed tip: use small N_SAMPLES (64) and short HORIZON (5) — planning quality
-           matters less than showing avoidance behaviour.
-
 Usage:
     MUJOCO_GL=osmesa python visualize_planner.py
 """
@@ -21,6 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
+from collections import deque
 
 sys.path.insert(0, ".")
 from safe_lewm.config import Config
@@ -40,7 +38,7 @@ SAFETY_W      = float(os.environ.get("SAFETY_W",    "20.0"))
 SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.5"))
 HISTORY       = int(os.environ.get("HISTORY",    "3"))
 SEED          = int(os.environ.get("SEED",       "0"))
-N_SEARCH      = int(os.environ.get("N_SEARCH",   "10"))   # episodes to search for a costly one
+N_SEARCH      = int(os.environ.get("N_SEARCH",   "15"))
 FPS           = int(os.environ.get("FPS",        "8"))
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -56,39 +54,43 @@ def denorm(frame_chw):
     f = frame_chw * IMAGENET_STD[:, None, None] + IMAGENET_MEAN[:, None, None]
     return (f.clip(0, 1).transpose(1, 2, 0) * 255).astype(np.uint8)
 
-def world_to_pixel(world_xy, mj_model, mj_data, cam_id, width=256, height=256):
-    """
-    Project world XY (ground plane, z=0) to pixel coordinates using
-    MuJoCo's actual camera matrices. Call this AFTER viz_env.render().
-    """
-    import mujoco
-    world_xyz = np.array([world_xy[0], world_xy[1], 0.0])
-    cam_pos   = mj_data.cam_xpos[cam_id].copy()            # (3,)
-    cam_mat   = mj_data.cam_xmat[cam_id].reshape(3, 3).copy()  # row = cam axis in world
-    fovy_deg  = mj_model.cam_fovy[cam_id]
-    f         = (height / 2.0) / np.tan(np.radians(fovy_deg / 2.0))
 
-    # Vector from camera to point, expressed in camera frame
-    dp      = world_xyz - cam_pos
-    p_cam   = cam_mat @ dp          # cam_mat rows are x,y,z axes of camera in world
-    # MuJoCo convention: camera looks along -Z, x=right, y=up
-    if p_cam[2] >= 0:
-        return (width // 2, height // 2)   # fallback: centre
+# ── Camera projection for "fixedfar" (pos="0 -5 5", zaxis="0 -1 1", fovy=45) ──
+# Camera axes in world frame:
+#   X = (1, 0, 0)              right
+#   Y = (0, 1/√2, 1/√2)       up-in-camera = up-right in world
+#   Z = (0, -1/√2, 1/√2)      camera "forward-back" axis (looks along -Z)
+_S  = 1.0 / np.sqrt(2.0)
+_FIXEDFAR_CAM_MAT = np.array([[1.0, 0.0, 0.0],
+                               [0.0,  _S,  _S],
+                               [0.0, -_S,  _S]], dtype=np.float64)
+_FIXEDFAR_CAM_POS = np.array([0.0, -5.0, 5.0], dtype=np.float64)
+_FIXEDFAR_FOVY    = 45.0   # degrees
+
+def world_to_pixel(world_xy, width=256, height=256):
+    """Project world XY (z=0 ground plane) to pixel for the fixedfar camera."""
+    world_xyz = np.array([world_xy[0], world_xy[1], 0.0], dtype=np.float64)
+    f   = (height / 2.0) / np.tan(np.radians(_FIXEDFAR_FOVY / 2.0))
+    dp  = world_xyz - _FIXEDFAR_CAM_POS
+    p_cam = _FIXEDFAR_CAM_MAT @ dp   # camera-space coords
+    if p_cam[2] >= 0:                 # point behind camera — fall back to centre
+        return (width // 2, height // 2)
     px = int( f * p_cam[0] / (-p_cam[2]) + width  / 2)
     py = int(-f * p_cam[1] / (-p_cam[2]) + height / 2)
     return px, py
 
 
 def draw_marker(frame, px, py, color, label, radius=8):
-    """Draw a filled circle + white outline + label at pixel (px, py)."""
+    """Filled circle + white outline + label text."""
     import cv2
     H, W = frame.shape[:2]
     if 0 <= px < W and 0 <= py < H:
-        cv2.circle(frame, (px, py), radius,     color,       -1)
-        cv2.circle(frame, (px, py), radius + 1, (255,255,255), 1)
+        cv2.circle(frame, (px, py), radius,     color,         -1)
+        cv2.circle(frame, (px, py), radius + 1, (255, 255, 255), 1)
         cv2.putText(frame, label, (px + radius + 2, py + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     return frame
+
 
 # ── Load model ─────────────────────────────────────────────────────────────────
 print("Loading world model...")
@@ -115,63 +117,67 @@ print(f"  Conformal threshold: {safe_threshold:.4f}")
 
 
 def get_z(obs_np):
-    """Encode a single observation (C, H, W) numpy -> (D,) tensor."""
+    """Encode (C, H, W) numpy obs → (D,) latent tensor."""
     x = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         return model.encoder(x).squeeze(0)
 
+
 def get_safety_score(z):
-    """(D,) -> scalar safety score."""
+    """(D,) → scalar safety score (higher = safer)."""
     z_n = (z.unsqueeze(0) - z_mean) / z_std
     with torch.no_grad():
         return clf(z_n).item()
 
-def get_goal_direction(raw_env):
+
+def get_agent_goal_pos(raw_env):
     """
-    Extract goal direction from environment internal state.
-    Returns (dx, dy) unit vector pointing from agent toward goal, in world frame.
+    Return (agent_xy, goal_xy, goal_dist) using safety_gymnasium task internals.
+    Falls back to zeros on any attribute error.
     """
     try:
         u = raw_env.unwrapped
-        agent_pos = np.array(u.agent.pos[:2])    # (x, y)
-        goal_pos  = np.array(u.task.goal.pos[:2])
+        agent_pos = np.array(u.agent.pos[:2], dtype=np.float64)
+        goal_pos  = np.array(u.task.goal.pos[:2], dtype=np.float64)
         delta = goal_pos - agent_pos
         dist  = np.linalg.norm(delta) + 1e-8
-        return delta / dist, dist
+        return agent_pos, goal_pos, dist
     except Exception:
-        return np.zeros(2), 999.0
+        return np.zeros(2), np.zeros(2), 999.0
+
+
+def get_goal_direction(raw_env):
+    """(dx, dy) unit vector toward goal from agent."""
+    agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
+    if dist < 990:
+        return (goal_xy - agent_xy) / dist, dist
+    return np.zeros(2), 999.0
 
 
 def mppi_step(z_hist_deque, U_warm, goal_dir_action):
     """
-    One MPPI planning step.
-    z_hist_deque: deque of (D,) tensors, length HISTORY
-    U_warm: (HORIZON, A) warm-start action tensor
-    goal_dir_action: (A,) numpy — base action pointing toward goal
-    Returns: (A,) action, updated U_warm
+    One MPPI step.
+    Returns: (action (A,), updated U_warm (H, A))
     """
     z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0).expand(N_SAMPLES, -1, -1)
 
-    # Warm-start centered on goal direction: bias samples toward the goal
     goal_bias = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
     noise = torch.randn(N_SAMPLES, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
-    # Each sampled sequence starts from goal direction + noise
+
     U_b = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
-    # Also bias half the samples directly toward goal to encourage exploration
-    U_b[:N_SAMPLES//2] = (goal_bias.unsqueeze(0).unsqueeze(0) + noise[:N_SAMPLES//2]).clamp(-1, 1)
+    # Half the samples biased toward goal direction
+    U_b[:N_SAMPLES // 2] = (goal_bias.unsqueeze(0).unsqueeze(0) + noise[:N_SAMPLES // 2]).clamp(-1, 1)
 
     z_seq    = model.rollout(z_hist, U_b, HISTORY)
-    z_rolled = z_seq[:, -HORIZON:, :]   # (N, H, D)
-
-    # Safety cost — penalize predicted unsafe states
+    z_rolled = z_seq[:, -HORIZON:, :]          # (N, H, D)
     z_flat   = z_rolled.reshape(N_SAMPLES * HORIZON, -1)
     z_flat_n = (z_flat - z_mean) / z_std
     scores   = clf(z_flat_n)
-    pen      = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
-    safety_cost = pen.reshape(N_SAMPLES, HORIZON).sum(-1)
 
-    # Total cost: only safety (goal handled by bias + warm-start toward goal dir)
-    total = SAFETY_W * safety_cost
+    pen         = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
+    safety_cost = pen.reshape(N_SAMPLES, HORIZON).sum(-1)
+    total       = SAFETY_W * safety_cost
+
     beta    = total.min()
     weights = torch.exp(-(total - beta) / TEMPERATURE)
     weights = weights / (weights.sum() + 1e-8)
@@ -179,12 +185,12 @@ def mppi_step(z_hist_deque, U_warm, goal_dir_action):
     U_warm = (weights[:, None, None] * U_b).sum(0).clamp(-1, 1)
     action = U_warm[0].clone()
     U_warm = torch.roll(U_warm, -1, dims=0)
-    U_warm[-1] = goal_bias   # next warm-start seeds from goal direction
+    U_warm[-1] = goal_bias
     return action, U_warm
 
 
 def make_viz_env(seed):
-    """Separate high-res env with fixedfar overhead camera for recording GIFs."""
+    """Separate env with fixedfar overhead camera for recording GIFs."""
     import safety_gymnasium
     viz = safety_gymnasium.make(
         cfg.env_name,
@@ -198,130 +204,62 @@ def make_viz_env(seed):
 
 
 def run_episode(env, use_planner=False, seed=SEED):
-    """Run one episode, return frames, costs, safety scores."""
+    """Run one episode; return (frames, costs, scores)."""
     obs = env.reset()
-
-    # Second env just for rendering — same seed so state is identical
     viz_env = make_viz_env(seed)
 
     frames, costs, scores = [], [], []
 
-    from collections import deque
     z_hist_deque = deque(maxlen=HISTORY)
     U_warm = torch.zeros(HORIZON, cfg.action_dim, device=DEVICE)
-
-    # Seed initial latent history
     z0 = get_z(obs)
     for _ in range(HISTORY):
         z_hist_deque.append(z0)
 
-    import mujoco
-
-    # ── Inspect model: print all body and camera names ────────────────────────
-    viz_env.render()   # populate data before reading
-    u_viz    = viz_env.unwrapped
-    mj_model = u_viz.model
-    mj_data  = u_viz.data
-
-    print("  Bodies in model:")
-    for i in range(mj_model.nbody):
-        bname = mj_model.body(i).name
-        pos   = mj_data.xpos[i]
-        print(f"    [{i}] '{bname}'  pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
-    print("  Cameras in model:")
-    for i in range(mj_model.ncam):
-        cname = mj_model.cam(i).name
-        print(f"    [{i}] '{cname}'")
-
-    # ── Find agent and goal bodies by name ─────────────────────────────────────
-    def find_body(name_substr):
-        for i in range(mj_model.nbody):
-            if name_substr.lower() in mj_model.body(i).name.lower():
-                return i, mj_model.body(i).name
-        return None, None
-
-    agent_bid, agent_bname = find_body("robot")
-    if agent_bid is None:
-        agent_bid, agent_bname = find_body("point")
-    if agent_bid is None:
-        agent_bid, agent_bname = find_body("agent")
-    goal_bid, goal_bname = find_body("goal")
-    print(f"  Agent body: [{agent_bid}] '{agent_bname}'")
-    print(f"  Goal  body: [{goal_bid}] '{goal_bname}'")
-
-    # ── Teleport goal behind a hazard on opposite side ─────────────────────────
-    start_xy = np.array(mj_data.xpos[agent_bid][:2]) if agent_bid is not None else np.zeros(2)
-    goal_xy  = np.array(mj_data.xpos[goal_bid][:2])  if goal_bid  is not None else np.zeros(2)
-
-    def teleport_goal(model, data, goal_bid, new_xy):
-        mocap_id = model.body_mocapid[goal_bid]
-        if mocap_id >= 0:
-            data.mocap_pos[mocap_id] = np.array([new_xy[0], new_xy[1], 0.0])
-            mujoco.mj_forward(model, data)
-            return True
-        return False
-
-    if goal_bid is not None:
-        # Place goal diagonally opposite the agent, 3.5m away
-        direction = -start_xy / (np.linalg.norm(start_xy) + 1e-8)
-        new_goal  = direction * 3.5
-        ok1 = teleport_goal(mj_model, mj_data, goal_bid, new_goal)
-        ok2 = teleport_goal(env.env.unwrapped.model, env.env.unwrapped.data,
-                            mujoco.mj_name2id(env.env.unwrapped.model,
-                                              mujoco.mjtObj.mjOBJ_BODY, goal_bname),
-                            new_goal)
-        goal_xy = new_goal
-        print(f"  Goal teleported to ({new_goal[0]:.2f},{new_goal[1]:.2f}): viz={ok1} main={ok2}")
-        # Re-render to reflect new goal position
-        viz_env.render()
-        mj_data = u_viz.data
-
-    # ── Camera for projection ─────────────────────────────────────────────────
-    cam_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "fixedfar")
-    print(f"  'fixedfar' cam_id={cam_id}")
-    if cam_id >= 0:
-        print(f"  cam_xpos={mj_data.cam_xpos[cam_id]}")
-        print(f"  cam fovy={mj_model.cam_fovy[cam_id]}")
-        sp = world_to_pixel(start_xy, mj_model, mj_data, cam_id)
-        gp = world_to_pixel(goal_xy,  mj_model, mj_data, cam_id)
-        has_markers = True
-        print(f"  START world={start_xy} → px={sp}")
-        print(f"  GOAL  world={goal_xy}  → px={gp}")
-    else:
-        has_markers = False
-        sp = gp = (128, 128)
+    # Record starting positions for markers
+    agent_xy, goal_xy, goal_dist_start = get_agent_goal_pos(env.env)
+    start_xy = agent_xy.copy()
+    sp = world_to_pixel(start_xy)
+    gp = world_to_pixel(goal_xy)
+    print(f"  Start: {start_xy}  px={sp}")
+    print(f"  Goal:  {goal_xy}   px={gp}  dist={goal_dist_start:.2f}m")
 
     for step in range(MAX_STEPS):
-        # Current safety score and goal direction
         z_cur = get_z(obs)
         score = get_safety_score(z_cur)
         goal_dir, goal_dist = get_goal_direction(env.env)
 
-        # High-res overhead frame from viz env
+        # High-res overhead frame
         raw_viz = viz_env.render()   # (256, 256, 3) uint8
         try:
             import cv2
             frame = raw_viz.copy()
 
-            # Draw start (cyan) and goal (yellow) markers using live camera data
-            if has_markers:
-                mj_data = viz_env.unwrapped.data   # refreshed after render()
-                _sp = world_to_pixel(start_xy, mj_model, mj_data, cam_id)
-                _gp = world_to_pixel(goal_xy,  mj_model, mj_data, cam_id)
-                draw_marker(frame, _sp[0], _sp[1], (0, 220, 255), "START", radius=7)
-                draw_marker(frame, _gp[0], _gp[1], (50, 220, 50), "GOAL",  radius=9)
+            # Live goal position (goal can move if env resets; agent pos changes each step)
+            _, live_goal_xy, _ = get_agent_goal_pos(viz_env)
+            live_agent_xy, _, _ = get_agent_goal_pos(viz_env)
+            cur_gp = world_to_pixel(live_goal_xy)
+            cur_ap = world_to_pixel(live_agent_xy)
+
+            # START marker (fixed, cyan) — where agent spawned
+            draw_marker(frame, sp[0], sp[1], (0, 220, 255), "S", radius=6)
+            # GOAL marker (bright green, slightly larger)
+            draw_marker(frame, cur_gp[0], cur_gp[1], (0, 210, 0), "G", radius=9)
+            # Current agent position (yellow dot, small)
+            draw_marker(frame, cur_ap[0], cur_ap[1], (50, 200, 255), "", radius=4)
 
             safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
-            color = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
-            cv2.putText(frame, f"t={step:3d}",          (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-            cv2.putText(frame, safe_str,                 (6, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.putText(frame, f"goal:{goal_dist:.2f}m", (6, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,80), 1)
+            color    = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
+            cv2.putText(frame, f"t={step:3d}",          (6, 18),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, safe_str,                 (6, 36),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,           2)
+            cv2.putText(frame, f"goal:{goal_dist:.1f}m", (6, 54),  cv2.FONT_HERSHEY_SIMPLEX, 0.45,(220, 220, 80),  1)
         except ImportError:
             frame = raw_viz
+
         frames.append(frame)
         scores.append(score)
 
-        # Action
+        # Choose action
         if use_planner:
             with torch.no_grad():
                 action, U_warm = mppi_step(z_hist_deque, U_warm, goal_dir)
@@ -330,21 +268,18 @@ def run_episode(env, use_planner=False, seed=SEED):
             action_np = env.action_space.sample()
 
         next_obs, r, c, done, _ = env.step(action_np)
-        viz_env.step(action_np)   # keep viz env in sync
+        viz_env.step(action_np)
 
-        # Red border overlay on cost steps
         costs.append(c)
         if c > 0:
             try:
                 import cv2
-                cv2.rectangle(frame, (0, 0), (255, 255), (255, 0, 0), 5)
+                cv2.rectangle(frame, (0, 0), (255, 255), (220, 0, 0), 5)
                 frames[-1] = frame
             except Exception:
                 pass
 
-        # Update latent history
-        z_next = get_z(next_obs)
-        z_hist_deque.append(z_next)
+        z_hist_deque.append(get_z(next_obs))
         obs = next_obs
 
         if step % 20 == 0:
@@ -357,48 +292,58 @@ def run_episode(env, use_planner=False, seed=SEED):
     return frames, np.array(costs), np.array(scores)
 
 
-# ── Find a seed where random policy hits hazards ───────────────────────────────
-# Hazards are sparse (~0.9% of steps) so we search across seeds.
-print(f"\nSearching for a seed where random policy hits hazards (up to {N_SEARCH} tries)...")
-best_seed = SEED
-best_cost = 0
-best_rnd  = None
+# ── Search for a seed with: random policy hits hazards AND goal starts far away ─
+print(f"\nSearching for good seed (cost>0 and initial goal_dist>2m) ...")
+best_seed    = SEED
+best_cost    = 0
+best_rnd     = None
+best_goal_dist = 0.0
 
 for trial_seed in range(SEED, SEED + N_SEARCH):
     env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                                   cfg.frame_skip, seed=trial_seed)
-    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False)
+    # Check initial goal distance before running full episode
+    env_trial.reset()
+    _, _, init_dist = get_agent_goal_pos(env_trial.env)
+    print(f"  seed={trial_seed}: initial goal_dist={init_dist:.2f}m", end="")
+
+    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False, seed=trial_seed)
     total = int(trial_costs.sum())
-    print(f"  seed={trial_seed}: random cost={total}")
-    if total > best_cost:
-        best_cost  = total
-        best_seed  = trial_seed
-        best_rnd   = (trial_frames, trial_costs, trial_scores)
-    if best_cost >= 3:   # good enough — stop searching
+    print(f" -> random cost={total}")
+
+    # Prefer seeds with high cost AND far initial goal
+    score = total * 2 + (init_dist > 2.5)
+    if score > best_cost * 2 + (best_goal_dist > 2.5):
+        best_cost      = total
+        best_seed      = trial_seed
+        best_rnd       = (trial_frames, trial_costs, trial_scores)
+        best_goal_dist = init_dist
+
+    if best_cost >= 3 and best_goal_dist > 2.0:
         break
 
 if best_rnd is None:
-    # Use whatever we have from last trial
     best_rnd = (trial_frames, trial_costs, trial_scores)
 
-print(f"\nBest seed={best_seed} with random cost={best_cost}")
+print(f"\nBest seed={best_seed}: random cost={best_cost}, initial goal_dist={best_goal_dist:.2f}m")
 rnd_frames, rnd_costs, rnd_scores = best_rnd
 
-# ── Run episodes ───────────────────────────────────────────────────────────────
-env = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=best_seed)
+# ── Run MPPI episode with best seed ───────────────────────────────────────────
+env_mppi = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
+                             cfg.frame_skip, seed=best_seed)
 
 print(f"\n{'='*50}")
-print(f"Random policy (seed={best_seed}) — already recorded above")
-print(f"  Total cost: {int(rnd_costs.sum())} | Steps: {len(rnd_costs)}")
+print(f"Random policy (seed={best_seed}) — total cost: {int(rnd_costs.sum())} | Steps: {len(rnd_costs)}")
 
 print(f"\n{'='*50}")
-print(f"Running MPPI-SAFE planner (same seed={best_seed})...")
-mppi_frames, mppi_costs, mppi_scores = run_episode(env, use_planner=True)
+print(f"Running MPPI-SAFE planner (seed={best_seed})...")
+mppi_frames, mppi_costs, mppi_scores = run_episode(env_mppi, use_planner=True, seed=best_seed)
 print(f"  Total cost: {int(mppi_costs.sum())} | Steps: {len(mppi_costs)}")
 
 # ── Save GIFs ─────────────────────────────────────────────────────────────────
 try:
     import imageio
+    import cv2
     print("\nSaving GIFs...")
 
     imageio.mimsave(str(OUT_DIR / "random_traj.gif"),  rnd_frames,  fps=FPS)
@@ -406,34 +351,28 @@ try:
     print(f"  Saved {OUT_DIR}/random_traj.gif")
     print(f"  Saved {OUT_DIR}/mppi_traj.gif")
 
-    # Side-by-side GIF (pad to same length)
+    # Side-by-side GIF
     n = min(len(rnd_frames), len(mppi_frames))
-    label_h = 20
-    import cv2
+    label_h = 22
     side_frames = []
     for i in range(n):
-        rnd_f   = rnd_frames[i]
-        mppi_f  = mppi_frames[i]
-        H, W, C = rnd_f.shape
-        # Label bars
+        rnd_f  = rnd_frames[i]
+        mppi_f = mppi_frames[i]
+        H, W, _ = rnd_f.shape
         rnd_label  = np.zeros((label_h, W, 3), dtype=np.uint8)
         mppi_label = np.zeros((label_h, W, 3), dtype=np.uint8)
-        try:
-            cv2.putText(rnd_label,  "RANDOM",    (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
-            cv2.putText(mppi_label, "MPPI-SAFE", (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100,220,100), 1)
-        except Exception:
-            pass
+        cv2.putText(rnd_label,  "RANDOM",    (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(mppi_label, "MPPI-SAFE", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 220, 100), 1)
         rnd_col  = np.vstack([rnd_label,  rnd_f])
         mppi_col = np.vstack([mppi_label, mppi_f])
         divider  = np.ones((H + label_h, 4, 3), dtype=np.uint8) * 200
-        combined = np.hstack([rnd_col, divider, mppi_col])
-        side_frames.append(combined)
+        side_frames.append(np.hstack([rnd_col, divider, mppi_col]))
 
     imageio.mimsave(str(OUT_DIR / "side_by_side.gif"), side_frames, fps=FPS)
     print(f"  Saved {OUT_DIR}/side_by_side.gif")
 
 except ImportError:
-    print("  imageio not found — skipping GIFs (pip install imageio)")
+    print("  imageio not found — skipping GIFs")
 
 # ── Comparison plot ────────────────────────────────────────────────────────────
 print("Saving comparison plot...")
@@ -442,29 +381,25 @@ n_mppi = len(mppi_costs)
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
-# Cumulative cost
 ax = axes[0, 0]
-ax.plot(np.cumsum(rnd_costs),  color="#E84C4C", label=f"Random  (total={int(rnd_costs.sum())})")
+ax.plot(np.cumsum(rnd_costs),  color="#E84C4C", label=f"Random   (total={int(rnd_costs.sum())})")
 ax.plot(np.cumsum(mppi_costs), color="#4C9BE8", label=f"MPPI-safe (total={int(mppi_costs.sum())})")
-ax.set_title("Cumulative Cost"); ax.set_xlabel("Step"); ax.set_ylabel("Cumulative cost")
+ax.set_title("Cumulative Cost"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
 ax.legend()
 
-# Safety score over time
 ax = axes[0, 1]
 ax.plot(rnd_scores,  color="#E84C4C", linewidth=0.7, alpha=0.8, label="Random")
 ax.plot(mppi_scores, color="#4C9BE8", linewidth=0.7, alpha=0.8, label="MPPI-safe")
 ax.axhline(safe_threshold, color="black", linestyle="--", label=f"threshold={safe_threshold:.2f}")
-ax.set_title("Safety Score Over Time"); ax.set_xlabel("Step"); ax.set_ylabel("Safety score")
+ax.set_title("Safety Score Over Time"); ax.set_xlabel("Step"); ax.set_ylabel("Score")
 ax.legend()
 
-# Cost per step
 ax = axes[1, 0]
 ax.fill_between(range(n_rnd),  rnd_costs,  alpha=0.5, color="#E84C4C", label="Random")
 ax.fill_between(range(n_mppi), mppi_costs, alpha=0.5, color="#4C9BE8", label="MPPI-safe")
 ax.set_title("Cost Per Step"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
 ax.legend()
 
-# Score distribution comparison
 ax = axes[1, 1]
 ax.hist(rnd_scores,  bins=40, alpha=0.6, color="#E84C4C", density=True, label="Random")
 ax.hist(mppi_scores, bins=40, alpha=0.6, color="#4C9BE8", density=True, label="MPPI-safe")
@@ -473,8 +408,8 @@ ax.set_title("Safety Score Distribution"); ax.set_xlabel("Score"); ax.set_ylabel
 ax.legend()
 
 plt.suptitle(
-    f"Random vs MPPI-Safe | Random cost={int(rnd_costs.sum())}  MPPI cost={int(mppi_costs.sum())}",
-    fontsize=12, fontweight="bold"
+    f"Random vs MPPI-Safe | seed={best_seed} | Random cost={int(rnd_costs.sum())}  MPPI cost={int(mppi_costs.sum())}",
+    fontsize=12, fontweight="bold",
 )
 plt.tight_layout()
 fig.savefig(OUT_DIR / "comparison.png", dpi=150, bbox_inches="tight")
@@ -486,4 +421,3 @@ print(f"Random:    total_cost={int(rnd_costs.sum())}, steps={n_rnd}")
 print(f"MPPI-safe: total_cost={int(mppi_costs.sum())}, steps={n_mppi}")
 cost_red = (rnd_costs.sum() - mppi_costs.sum()) / (rnd_costs.sum() + 1e-8) * 100
 print(f"Cost reduction: {cost_red:.1f}%")
-print(f"\nAll outputs saved to {OUT_DIR}/")
