@@ -22,9 +22,10 @@ from safe_lewm.model import SafeJEPA
 from safe_lewm.dataset import load_trajectories
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHECKPOINT  = "/mnt/t7shield/safe_lewm.pt"
-DATA_PATH   = "/mnt/t7shield/safety_point_goal.pkl"
-OUT_DIR     = Path("latent_probe")
+import os
+CHECKPOINT  = os.environ.get("CHECKPOINT", "/mnt/t7shield/safe_lewm.pt")
+DATA_PATH   = os.environ.get("DATA_PATH",  "/mnt/t7shield/safety_point_goal.pkl")
+OUT_DIR     = Path(os.environ.get("OUT_DIR", "latent_probe"))
 MAX_SAMPLES = 5000   # how many obs to encode (safe + unsafe combined)
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 # ──────────────────────────────────────────────────────────────────────────────
