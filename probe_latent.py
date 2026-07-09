@@ -120,6 +120,11 @@ for ax, (pc_x, pc_y) in zip(axes, [(0, 1), (1, 2)]):
         mask = labels == lab
         ax.scatter(Z_pca[mask, pc_x], Z_pca[mask, pc_y],
                    c=color, marker=marker, s=12, alpha=0.5, label=name)
+    # Clip axes to 99th percentile to suppress outliers
+    for dim, setter in [(pc_x, ax.set_xlim), (pc_y, ax.set_ylim)]:
+        lo, hi = np.percentile(Z_pca[:, dim], [0.5, 99.5])
+        pad = (hi - lo) * 0.1 or 1.0
+        setter(lo - pad, hi + pad)
     ax.set_xlabel(f"PC{pc_x+1} ({pca.explained_variance_ratio_[pc_x]*100:.1f}%)")
     ax.set_ylabel(f"PC{pc_y+1} ({pca.explained_variance_ratio_[pc_y]*100:.1f}%)")
     ax.set_title(f"PCA: PC{pc_x+1} vs PC{pc_y+1}")
