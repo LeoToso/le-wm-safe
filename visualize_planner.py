@@ -157,16 +157,14 @@ def get_agent_goal_pos(raw_env):
         # Diagnose builder attributes once
         if not _BUILDER_DIAGNOSED:
             _BUILDER_DIAGNOSED = True
-            interesting = [a for a in dir(u) if not a.startswith('_') and
-                           any(k in a.lower() for k in ['agent','goal','task','world','pos','data','model'])]
-            print(f"  [diag] Builder type: {type(u).__name__}")
-            print(f"  [diag] Interesting attrs: {interesting[:30]}")
-            for path in ['agent.pos', 'task.goal.pos', 'world.data.qpos',
-                         'agent.get_position', 'task.goal_pos']:
+            task_attrs = [a for a in dir(u.task) if not a.startswith('_')]
+            print(f"  [diag] task attrs: {task_attrs[:40]}")
+            for path in ['task.goal.pos', 'task.agent.pos', '_agent.pos',
+                         'task.world.data.qpos', 'task.engine.data.qpos']:
                 v = _try_get(u, path)
-                print(f"  [diag] {path} = {v[:3] if hasattr(v,'__len__') else v}")
+                print(f"  [diag] {path} = {np.array(v)[:3] if v is not None and hasattr(v,'__len__') else v}")
 
-        agent_pos = _try_get(u, 'agent.pos', 'agent.get_position')
+        agent_pos = _try_get(u, 'task.agent.pos', '_agent.pos', 'agent.pos')
         goal_pos  = _try_get(u, 'task.goal.pos', 'task.goal_pos', 'goal_pos')
 
         if agent_pos is not None and goal_pos is not None:
