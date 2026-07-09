@@ -35,7 +35,7 @@ N_SAMPLES     = int(os.environ.get("N_SAMPLES",  "64"))
 HORIZON       = int(os.environ.get("HORIZON",    "5"))
 TEMPERATURE   = float(os.environ.get("TEMPERATURE", "0.05"))
 SAFETY_W      = float(os.environ.get("SAFETY_W",    "20.0"))
-SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","1.5"))
+SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.5"))
 HISTORY       = int(os.environ.get("HISTORY",    "3"))
 SEED          = int(os.environ.get("SEED",       "0"))
 N_SEARCH      = int(os.environ.get("N_SEARCH",   "15"))
@@ -150,34 +150,30 @@ def get_goal_direction(raw_env, wrapper=None):
     return np.zeros(2), 999.0
 
 
-def safe_goal_step(z_hist_deque, U_warm, goal_dir_action):
+def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
     """
-    SLS²-style safe-goal controller:
-      1. Predict safety of next state under the goal-directed action.
-      2. If predicted-safe: take the goal-directed action directly (no MPPI overhead).
-      3. If predicted-unsafe: run MPPI (safety cost) with goal-direction bias so the
-         agent navigates AROUND the hazard while still aiming for the goal.
+    SLS²-style safe-goal controller with hard reactive switch:
+      - SAFE  (current_score >= threshold + margin): go straight to goal.
+      - UNSAFE (current_score <  threshold + margin): MPPI escape biased toward goal.
+
+    Using the CURRENT score (not predicted future) avoids over-conservative
+    blocking caused by the goal being near hazards in the latent space. The agent
+    charges toward the goal until the classifier detects an actual hazard, then dodges.
     """
     goal_t = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
-    z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)  # (1, H, D)
 
-    # ── Step 1: full-horizon look-ahead safety check ──────────────────────────
-    # Repeat goal action for entire HORIZON and check that all predicted states are safe
-    a_goal_seq = goal_t.clamp(-1, 1).unsqueeze(0).unsqueeze(0).expand(1, HORIZON, -1)
-    z_pred_seq = model.rollout(z_hist, a_goal_seq, HISTORY)[:, -HORIZON:, :]  # (1, H, D)
-    z_pred_n   = (z_pred_seq.squeeze(0) - z_mean) / z_std  # (H, D)
-    min_score  = clf(z_pred_n).min().item()
-
-    if min_score >= safe_threshold + SAFETY_MARGIN:
-        # Predicted safe: go straight to goal — fast, no MPPI needed
+    if current_score >= safe_threshold + SAFETY_MARGIN:
+        # Safe: go straight to goal at full speed
         return goal_t.clamp(-1, 1), U_warm
 
-    # ── Step 2: MPPI with safety cost + goal-direction bias ───────────────────
-    N = N_SAMPLES
-    z_h   = z_hist.expand(N, -1, -1)
+    # Unsafe: MPPI escape. Half samples biased toward goal so the agent navigates
+    # AROUND the hazard rather than reversing away from it.
+    z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)
+    N   = N_SAMPLES
+    z_h = z_hist.expand(N, -1, -1)
+
     noise = torch.randn(N, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
-    U_b   = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
-    # Half the samples are initialised toward goal so MPPI explores around it
+    U_b  = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
     U_b[:N // 2] = (goal_t.unsqueeze(0).unsqueeze(0) + noise[:N // 2]).clamp(-1, 1)
 
     z_seq    = model.rollout(z_h, U_b, HISTORY)
@@ -195,7 +191,7 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action):
     U_warm = (weights[:, None, None] * U_b).sum(0).clamp(-1, 1)
     action = U_warm[0].clone()
     U_warm = torch.roll(U_warm, -1, dims=0)
-    U_warm[-1] = goal_t   # seed next warm-start with goal direction
+    U_warm[-1] = goal_t
     return action, U_warm
 
 
@@ -275,7 +271,7 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir)
+                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score)
             action_np = action.cpu().numpy()
         else:
             action_np = env.action_space.sample()
