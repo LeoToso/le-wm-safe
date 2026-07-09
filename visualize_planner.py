@@ -40,6 +40,7 @@ SAFETY_W      = float(os.environ.get("SAFETY_W",    "20.0"))
 SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.5"))
 HISTORY       = int(os.environ.get("HISTORY",    "3"))
 SEED          = int(os.environ.get("SEED",       "0"))
+N_SEARCH      = int(os.environ.get("N_SEARCH",   "10"))   # episodes to search for a costly one
 FPS           = int(os.environ.get("FPS",        "8"))
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -207,16 +208,42 @@ def run_episode(env, use_planner=False, seed=SEED):
     return frames, np.array(costs), np.array(scores)
 
 
+# ── Find a seed where random policy hits hazards ───────────────────────────────
+# Hazards are sparse (~0.9% of steps) so we search across seeds.
+print(f"\nSearching for a seed where random policy hits hazards (up to {N_SEARCH} tries)...")
+best_seed = SEED
+best_cost = 0
+best_rnd  = None
+
+for trial_seed in range(SEED, SEED + N_SEARCH):
+    env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
+                                  cfg.frame_skip, seed=trial_seed)
+    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False)
+    total = int(trial_costs.sum())
+    print(f"  seed={trial_seed}: random cost={total}")
+    if total > best_cost:
+        best_cost  = total
+        best_seed  = trial_seed
+        best_rnd   = (trial_frames, trial_costs, trial_scores)
+    if best_cost >= 3:   # good enough — stop searching
+        break
+
+if best_rnd is None:
+    # Use whatever we have from last trial
+    best_rnd = (trial_frames, trial_costs, trial_scores)
+
+print(f"\nBest seed={best_seed} with random cost={best_cost}")
+rnd_frames, rnd_costs, rnd_scores = best_rnd
+
 # ── Run episodes ───────────────────────────────────────────────────────────────
-env = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=SEED)
+env = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=best_seed)
 
 print(f"\n{'='*50}")
-print("Running RANDOM policy episode...")
-rnd_frames, rnd_costs, rnd_scores = run_episode(env, use_planner=False)
+print(f"Random policy (seed={best_seed}) — already recorded above")
 print(f"  Total cost: {int(rnd_costs.sum())} | Steps: {len(rnd_costs)}")
 
 print(f"\n{'='*50}")
-print("Running MPPI-SAFE planner episode...")
+print(f"Running MPPI-SAFE planner (same seed={best_seed})...")
 mppi_frames, mppi_costs, mppi_scores = run_episode(env, use_planner=True)
 print(f"  Total cost: {int(mppi_costs.sum())} | Steps: {len(mppi_costs)}")
 
