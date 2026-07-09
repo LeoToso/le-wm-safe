@@ -56,25 +56,26 @@ def denorm(frame_chw):
     f = frame_chw * IMAGENET_STD[:, None, None] + IMAGENET_MEAN[:, None, None]
     return (f.clip(0, 1).transpose(1, 2, 0) * 255).astype(np.uint8)
 
-def world_to_pixel(world_xy, width=256, height=256):
+def world_to_pixel(world_xy, mj_model, mj_data, cam_id, width=256, height=256):
     """
-    Project world (x, y) ground-plane coordinates to pixel (px, py).
-
-    Calibrated for the 'fixedfar' camera:
-      pos="0 -5 5", zaxis="0 -1 1"  (45-degree diagonal, looking at origin)
-
-    The arena spans roughly ±5m in x and ±5m in y.
-    At ground level (z=0):
-      - world_x → pixel_x  (camera x-axis is aligned with world x)
-      - world_y → pixel_y  (foreshortened by cos45 due to 45° tilt)
-    Empirical scale: ~22 px/m for x, ~15 px/m for y (foreshortened).
-    Origin maps to image center.
+    Project world XY (ground plane, z=0) to pixel coordinates using
+    MuJoCo's actual camera matrices. Call this AFTER viz_env.render().
     """
-    cx, cy = width / 2, height / 2
-    scale_x = 22.0   # px per metre, horizontal
-    scale_y = 15.0   # px per metre, vertical (foreshortened at 45°)
-    px = int(cx + scale_x * world_xy[0])
-    py = int(cy - scale_y * world_xy[1])   # y flipped (world +y = image up)
+    import mujoco
+    world_xyz = np.array([world_xy[0], world_xy[1], 0.0])
+    cam_pos   = mj_data.cam_xpos[cam_id].copy()            # (3,)
+    cam_mat   = mj_data.cam_xmat[cam_id].reshape(3, 3).copy()  # row = cam axis in world
+    fovy_deg  = mj_model.cam_fovy[cam_id]
+    f         = (height / 2.0) / np.tan(np.radians(fovy_deg / 2.0))
+
+    # Vector from camera to point, expressed in camera frame
+    dp      = world_xyz - cam_pos
+    p_cam   = cam_mat @ dp          # cam_mat rows are x,y,z axes of camera in world
+    # MuJoCo convention: camera looks along -Z, x=right, y=up
+    if p_cam[2] >= 0:
+        return (width // 2, height // 2)   # fallback: centre
+    px = int( f * p_cam[0] / (-p_cam[2]) + width  / 2)
+    py = int(-f * p_cam[1] / (-p_cam[2]) + height / 2)
     return px, py
 
 
@@ -214,34 +215,57 @@ def run_episode(env, use_planner=False, seed=SEED):
     for _ in range(HISTORY):
         z_hist_deque.append(z0)
 
-    # Move goal far from start (opposite side of arena)
-    try:
-        u = env.env.unwrapped
-        agent_xy  = np.array(u.agent.pos[:2])
-        # Place goal on the opposite side, 4m away
-        far_dir   = -agent_xy / (np.linalg.norm(agent_xy) + 1e-8)
-        far_goal  = far_dir * 4.0
-        # Set goal mocap body position
-        goal_body = u.model.body("goal").id
-        u.data.mocap_pos[0] = np.array([far_goal[0], far_goal[1], 0.0])
-        import mujoco
-        mujoco.mj_forward(u.model, u.data)
-    except Exception as e:
-        print(f"  Note: could not move goal ({e}), using default position")
+    # ── Teleport goal to opposite side of arena (~4m away), behind hazards ───
+    import mujoco
+    def set_goal_far(u, agent_xy):
+        """Move the goal mocap body to the opposite side from the agent."""
+        try:
+            # Diagonal opposite: negate agent direction and go 4m
+            direction = -np.array(agent_xy) / (np.linalg.norm(agent_xy) + 1e-8)
+            far_pos   = direction * 3.8
+            # Find mocap index for the goal body
+            goal_body_id = mujoco.mj_name2id(u.model, mujoco.mjtObj.mjOBJ_BODY, "goal")
+            mocap_id = u.model.body_mocapid[goal_body_id]
+            if mocap_id >= 0:
+                u.data.mocap_pos[mocap_id] = np.array([far_pos[0], far_pos[1], 0.0])
+                mujoco.mj_forward(u.model, u.data)
+                return far_pos
+        except Exception as e:
+            print(f"    goal teleport failed: {e}")
+        return None
 
-    # Record start and goal world positions once (fixed per episode)
     try:
-        u = env.env.unwrapped
-        start_xy = np.array(u.agent.pos[:2])
-        goal_xy  = np.array(u.task.goal.pos[:2])
-        start_px = world_to_pixel(start_xy)
-        goal_px  = world_to_pixel(goal_xy)
-        has_markers = True
-        print(f"  Start world=({start_xy[0]:.2f},{start_xy[1]:.2f}) px={start_px}")
-        print(f"  Goal  world=({goal_xy[0]:.2f},{goal_xy[1]:.2f}) px={goal_px}")
+        u_main = env.env.unwrapped
+        agent_xy = np.array(u_main.agent.pos[:2])
+        far = set_goal_far(u_main, agent_xy)
+        if far is not None:
+            set_goal_far(viz_env.unwrapped, agent_xy)   # sync viz env too
+            print(f"  Goal teleported to ({far[0]:.2f}, {far[1]:.2f})")
+        else:
+            print("  Using default goal position")
     except Exception as e:
-        print(f"  Warning: could not get marker positions ({e})")
+        print(f"  Goal setup error: {e}")
+
+    # ── Get start / goal positions and camera info for markers ────────────────
+    # Render one frame first so MuJoCo populates cam_xpos / cam_xmat
+    viz_env.render()
+    try:
+        u_viz    = viz_env.unwrapped
+        mj_model = u_viz.model
+        mj_data  = u_viz.data
+        cam_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "fixedfar")
+        u_main   = env.env.unwrapped
+        start_xy = np.array(u_main.agent.pos[:2])
+        goal_xy  = np.array(u_main.task.goal.pos[:2])
+        sp = world_to_pixel(start_xy, mj_model, mj_data, cam_id)
+        gp = world_to_pixel(goal_xy,  mj_model, mj_data, cam_id)
+        has_markers = True
+        print(f"  START world=({start_xy[0]:.2f},{start_xy[1]:.2f})  px={sp}")
+        print(f"  GOAL  world=({goal_xy[0]:.2f},{goal_xy[1]:.2f})   px={gp}")
+    except Exception as e:
+        print(f"  Marker setup error: {e}")
         has_markers = False
+        mj_model = mj_data = cam_id = sp = gp = None
 
     for step in range(MAX_STEPS):
         # Current safety score and goal direction
@@ -255,10 +279,13 @@ def run_episode(env, use_planner=False, seed=SEED):
             import cv2
             frame = raw_viz.copy()
 
-            # Draw start (cyan) and goal (yellow) markers
+            # Draw start (cyan) and goal (yellow) markers using live camera data
             if has_markers:
-                draw_marker(frame, start_px[0], start_px[1], (0, 220, 255), "START", radius=7)
-                draw_marker(frame, goal_px[0],  goal_px[1],  (0, 220, 100), "GOAL",  radius=9)
+                mj_data = viz_env.unwrapped.data   # refreshed after render()
+                _sp = world_to_pixel(start_xy, mj_model, mj_data, cam_id)
+                _gp = world_to_pixel(goal_xy,  mj_model, mj_data, cam_id)
+                draw_marker(frame, _sp[0], _sp[1], (0, 220, 255), "START", radius=7)
+                draw_marker(frame, _gp[0], _gp[1], (50, 220, 50), "GOAL",  radius=9)
 
             safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
             color = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
