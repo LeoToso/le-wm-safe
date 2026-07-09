@@ -215,57 +215,81 @@ def run_episode(env, use_planner=False, seed=SEED):
     for _ in range(HISTORY):
         z_hist_deque.append(z0)
 
-    # ── Teleport goal to opposite side of arena (~4m away), behind hazards ───
     import mujoco
-    def set_goal_far(u, agent_xy):
-        """Move the goal mocap body to the opposite side from the agent."""
-        try:
-            # Diagonal opposite: negate agent direction and go 4m
-            direction = -np.array(agent_xy) / (np.linalg.norm(agent_xy) + 1e-8)
-            far_pos   = direction * 3.8
-            # Find mocap index for the goal body
-            goal_body_id = mujoco.mj_name2id(u.model, mujoco.mjtObj.mjOBJ_BODY, "goal")
-            mocap_id = u.model.body_mocapid[goal_body_id]
-            if mocap_id >= 0:
-                u.data.mocap_pos[mocap_id] = np.array([far_pos[0], far_pos[1], 0.0])
-                mujoco.mj_forward(u.model, u.data)
-                return far_pos
-        except Exception as e:
-            print(f"    goal teleport failed: {e}")
-        return None
 
-    try:
-        u_main = env.env.unwrapped
-        agent_xy = np.array(u_main.agent.pos[:2])
-        far = set_goal_far(u_main, agent_xy)
-        if far is not None:
-            set_goal_far(viz_env.unwrapped, agent_xy)   # sync viz env too
-            print(f"  Goal teleported to ({far[0]:.2f}, {far[1]:.2f})")
-        else:
-            print("  Using default goal position")
-    except Exception as e:
-        print(f"  Goal setup error: {e}")
+    # ── Inspect model: print all body and camera names ────────────────────────
+    viz_env.render()   # populate data before reading
+    u_viz    = viz_env.unwrapped
+    mj_model = u_viz.model
+    mj_data  = u_viz.data
 
-    # ── Get start / goal positions and camera info for markers ────────────────
-    # Render one frame first so MuJoCo populates cam_xpos / cam_xmat
-    viz_env.render()
-    try:
-        u_viz    = viz_env.unwrapped
-        mj_model = u_viz.model
-        mj_data  = u_viz.data
-        cam_id   = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "fixedfar")
-        u_main   = env.env.unwrapped
-        start_xy = np.array(u_main.agent.pos[:2])
-        goal_xy  = np.array(u_main.task.goal.pos[:2])
+    print("  Bodies in model:")
+    for i in range(mj_model.nbody):
+        bname = mj_model.body(i).name
+        pos   = mj_data.xpos[i]
+        print(f"    [{i}] '{bname}'  pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})")
+    print("  Cameras in model:")
+    for i in range(mj_model.ncam):
+        cname = mj_model.cam(i).name
+        print(f"    [{i}] '{cname}'")
+
+    # ── Find agent and goal bodies by name ─────────────────────────────────────
+    def find_body(name_substr):
+        for i in range(mj_model.nbody):
+            if name_substr.lower() in mj_model.body(i).name.lower():
+                return i, mj_model.body(i).name
+        return None, None
+
+    agent_bid, agent_bname = find_body("robot")
+    if agent_bid is None:
+        agent_bid, agent_bname = find_body("point")
+    if agent_bid is None:
+        agent_bid, agent_bname = find_body("agent")
+    goal_bid, goal_bname = find_body("goal")
+    print(f"  Agent body: [{agent_bid}] '{agent_bname}'")
+    print(f"  Goal  body: [{goal_bid}] '{goal_bname}'")
+
+    # ── Teleport goal behind a hazard on opposite side ─────────────────────────
+    start_xy = np.array(mj_data.xpos[agent_bid][:2]) if agent_bid is not None else np.zeros(2)
+    goal_xy  = np.array(mj_data.xpos[goal_bid][:2])  if goal_bid  is not None else np.zeros(2)
+
+    def teleport_goal(model, data, goal_bid, new_xy):
+        mocap_id = model.body_mocapid[goal_bid]
+        if mocap_id >= 0:
+            data.mocap_pos[mocap_id] = np.array([new_xy[0], new_xy[1], 0.0])
+            mujoco.mj_forward(model, data)
+            return True
+        return False
+
+    if goal_bid is not None:
+        # Place goal diagonally opposite the agent, 3.5m away
+        direction = -start_xy / (np.linalg.norm(start_xy) + 1e-8)
+        new_goal  = direction * 3.5
+        ok1 = teleport_goal(mj_model, mj_data, goal_bid, new_goal)
+        ok2 = teleport_goal(env.env.unwrapped.model, env.env.unwrapped.data,
+                            mujoco.mj_name2id(env.env.unwrapped.model,
+                                              mujoco.mjtObj.mjOBJ_BODY, goal_bname),
+                            new_goal)
+        goal_xy = new_goal
+        print(f"  Goal teleported to ({new_goal[0]:.2f},{new_goal[1]:.2f}): viz={ok1} main={ok2}")
+        # Re-render to reflect new goal position
+        viz_env.render()
+        mj_data = u_viz.data
+
+    # ── Camera for projection ─────────────────────────────────────────────────
+    cam_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "fixedfar")
+    print(f"  'fixedfar' cam_id={cam_id}")
+    if cam_id >= 0:
+        print(f"  cam_xpos={mj_data.cam_xpos[cam_id]}")
+        print(f"  cam fovy={mj_model.cam_fovy[cam_id]}")
         sp = world_to_pixel(start_xy, mj_model, mj_data, cam_id)
         gp = world_to_pixel(goal_xy,  mj_model, mj_data, cam_id)
         has_markers = True
-        print(f"  START world=({start_xy[0]:.2f},{start_xy[1]:.2f})  px={sp}")
-        print(f"  GOAL  world=({goal_xy[0]:.2f},{goal_xy[1]:.2f})   px={gp}")
-    except Exception as e:
-        print(f"  Marker setup error: {e}")
+        print(f"  START world={start_xy} → px={sp}")
+        print(f"  GOAL  world={goal_xy}  → px={gp}")
+    else:
         has_markers = False
-        mj_model = mj_data = cam_id = sp = gp = None
+        sp = gp = (128, 128)
 
     for step in range(MAX_STEPS):
         # Current safety score and goal direction
