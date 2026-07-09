@@ -15,6 +15,7 @@ class SafetyGymWrapper:
         self.frame_skip = frame_skip
         self.frames = deque(maxlen=frame_stack)
         self.seed = seed
+        self._last_vec_obs = None   # last vector obs from the raw env (before image wrapping)
 
     def _get_frame(self):
         """Render and resize frame to (3, H, W) normalized."""
@@ -32,7 +33,9 @@ class SafetyGymWrapper:
         return np.concatenate(list(self.frames), axis=0)
 
     def reset(self):
-        self.env.reset(seed=self.seed)
+        result = self.env.reset(seed=self.seed)
+        # result is (vec_obs, info) in newer gymnasium API or just vec_obs in older
+        self._last_vec_obs = result[0] if isinstance(result, tuple) else result
         frame = self._get_frame()
         for _ in range(self.frame_stack):
             self.frames.append(frame)
@@ -50,6 +53,7 @@ class SafetyGymWrapper:
             else:
                 obs, reward, terminated, truncated, info = result
                 cost = info.get("cost", 0.0)
+            self._last_vec_obs = obs   # store vector obs for goal direction extraction
             total_reward += reward
             total_cost += cost
             if terminated or truncated:

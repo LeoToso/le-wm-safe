@@ -130,27 +130,100 @@ def get_safety_score(z):
         return clf(z_n).item()
 
 
+_BUILDER_DIAGNOSED = False
+
+def _try_get(obj, *paths):
+    """Try attribute paths until one works; return value or None."""
+    for path in paths:
+        try:
+            v = obj
+            for p in path.split('.'):
+                v = getattr(v, p)
+            return v
+        except AttributeError:
+            continue
+    return None
+
+
 def get_agent_goal_pos(raw_env):
     """
-    Return (agent_xy, goal_xy, goal_dist) using safety_gymnasium task internals.
-    Falls back to zeros on any attribute error.
+    Return (agent_xy, goal_xy, goal_dist) using safety_gymnasium internals.
+    Tries multiple attribute paths; falls back to zeros on failure.
     """
+    global _BUILDER_DIAGNOSED
     try:
         u = raw_env.unwrapped
-        agent_pos = np.array(u.agent.pos[:2], dtype=np.float64)
-        goal_pos  = np.array(u.task.goal.pos[:2], dtype=np.float64)
-        delta = goal_pos - agent_pos
-        dist  = np.linalg.norm(delta) + 1e-8
-        return agent_pos, goal_pos, dist
+
+        # Diagnose builder attributes once
+        if not _BUILDER_DIAGNOSED:
+            _BUILDER_DIAGNOSED = True
+            interesting = [a for a in dir(u) if not a.startswith('_') and
+                           any(k in a.lower() for k in ['agent','goal','task','world','pos','data','model'])]
+            print(f"  [diag] Builder type: {type(u).__name__}")
+            print(f"  [diag] Interesting attrs: {interesting[:30]}")
+            for path in ['agent.pos', 'task.goal.pos', 'world.data.qpos',
+                         'agent.get_position', 'task.goal_pos']:
+                v = _try_get(u, path)
+                print(f"  [diag] {path} = {v[:3] if hasattr(v,'__len__') else v}")
+
+        agent_pos = _try_get(u, 'agent.pos', 'agent.get_position')
+        goal_pos  = _try_get(u, 'task.goal.pos', 'task.goal_pos', 'goal_pos')
+
+        if agent_pos is not None and goal_pos is not None:
+            a = np.array(agent_pos[:2], dtype=np.float64)
+            g = np.array(goal_pos[:2],  dtype=np.float64)
+            dist = np.linalg.norm(g - a) + 1e-8
+            return a, g, dist
+    except Exception as e:
+        if not _BUILDER_DIAGNOSED:
+            print(f"  [diag] get_agent_goal_pos failed: {e}")
+    return np.zeros(2), np.zeros(2), 999.0
+
+
+def get_goal_direction_from_vec_obs(wrapper):
+    """
+    Extract goal direction from the safety_gymnasium vector observation.
+    The raw env returns a dict-like obs with a 'goal_compass' or similar field,
+    or a flat array where the first elements encode goal info.
+    Falls back to zeros on failure.
+    """
+    try:
+        vec_obs = wrapper._last_vec_obs
+        if vec_obs is None:
+            return np.zeros(2), 999.0
+
+        # safety_gymnasium obs may be a dict (newer API) or a flat array
+        if isinstance(vec_obs, dict):
+            # Try common keys
+            for key in ['goal_compass', 'goal', 'goal_lidar', 'hazards_lidar']:
+                if key in vec_obs:
+                    arr = np.array(vec_obs[key], dtype=np.float64)
+                    if arr.ndim == 1 and len(arr) >= 2:
+                        # Treat as (cos, sin) of goal angle, or (dx, dy)
+                        d = arr[:2]
+                        norm = np.linalg.norm(d) + 1e-8
+                        return d / norm, float(1.0 / norm)  # rough dist estimate
+        else:
+            # Flat array: try to infer goal direction from first 2 components
+            arr = np.array(vec_obs, dtype=np.float64)
+            if len(arr) >= 2:
+                d = arr[:2]
+                norm = np.linalg.norm(d) + 1e-8
+                if norm < 10.0:   # plausible compass vector
+                    return d / norm, norm
     except Exception:
-        return np.zeros(2), np.zeros(2), 999.0
+        pass
+    return np.zeros(2), 999.0
 
 
-def get_goal_direction(raw_env):
-    """(dx, dy) unit vector toward goal from agent."""
+def get_goal_direction(raw_env, wrapper=None):
+    """(dx, dy) unit vector toward goal from agent, and distance."""
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
     if dist < 990:
-        return (goal_xy - agent_xy) / dist, dist
+        return (goal_xy - agent_xy) / (dist + 1e-8), dist
+    # Fallback: try vector observation
+    if wrapper is not None:
+        return get_goal_direction_from_vec_obs(wrapper)
     return np.zeros(2), 999.0
 
 
@@ -218,6 +291,10 @@ def run_episode(env, use_planner=False, seed=SEED):
 
     # Record starting positions for markers
     agent_xy, goal_xy, goal_dist_start = get_agent_goal_pos(env.env)
+    if goal_dist_start > 990:
+        # Builder API failed; try vector obs fallback for initial goal dir (no absolute pos available)
+        _, goal_dist_start = get_goal_direction_from_vec_obs(env)
+        goal_xy = np.zeros(2)   # unknown; markers will be inaccurate but functional
     start_xy = agent_xy.copy()
     sp = world_to_pixel(start_xy)
     gp = world_to_pixel(goal_xy)
@@ -227,7 +304,7 @@ def run_episode(env, use_planner=False, seed=SEED):
     for step in range(MAX_STEPS):
         z_cur = get_z(obs)
         score = get_safety_score(z_cur)
-        goal_dir, goal_dist = get_goal_direction(env.env)
+        goal_dir, goal_dist = get_goal_direction(env.env, wrapper=env)
 
         # High-res overhead frame
         raw_viz = viz_env.render()   # (256, 256, 3) uint8
@@ -235,9 +312,8 @@ def run_episode(env, use_planner=False, seed=SEED):
             import cv2
             frame = raw_viz.copy()
 
-            # Live goal position (goal can move if env resets; agent pos changes each step)
-            _, live_goal_xy, _ = get_agent_goal_pos(viz_env)
-            live_agent_xy, _, _ = get_agent_goal_pos(viz_env)
+            # Live goal and agent positions for markers
+            live_agent_xy, live_goal_xy, _ = get_agent_goal_pos(viz_env)
             cur_gp = world_to_pixel(live_goal_xy)
             cur_ap = world_to_pixel(live_agent_xy)
 
