@@ -151,22 +151,17 @@ def get_goal_direction(raw_env, wrapper=None):
     return np.zeros(2), 999.0
 
 
-def mppi_step(z_hist_deque, U_warm, goal_dir_action):
+def mppi_safe_escape(z_hist_deque, U_warm):
     """
-    One MPPI step.
+    MPPI used ONLY for safety: find the action sequence with minimum safety cost.
     Returns: (action (A,), updated U_warm (H, A))
     """
     z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0).expand(N_SAMPLES, -1, -1)
-
-    goal_bias = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
-    noise = torch.randn(N_SAMPLES, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
-
-    U_b = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
-    # Half the samples biased toward goal direction
-    U_b[:N_SAMPLES // 2] = (goal_bias.unsqueeze(0).unsqueeze(0) + noise[:N_SAMPLES // 2]).clamp(-1, 1)
+    noise  = torch.randn(N_SAMPLES, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
+    U_b    = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
 
     z_seq    = model.rollout(z_hist, U_b, HISTORY)
-    z_rolled = z_seq[:, -HORIZON:, :]          # (N, H, D)
+    z_rolled = z_seq[:, -HORIZON:, :]
     z_flat   = z_rolled.reshape(N_SAMPLES * HORIZON, -1)
     z_flat_n = (z_flat - z_mean) / z_std
     scores   = clf(z_flat_n)
@@ -174,23 +169,42 @@ def mppi_step(z_hist_deque, U_warm, goal_dir_action):
     pen         = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
     safety_cost = pen.reshape(N_SAMPLES, HORIZON).sum(-1)
 
-    # Goal-alignment cost: penalize action sequences that don't point toward goal.
-    # Use cosine similarity of each action with the goal direction.
-    goal_t      = goal_bias  # (A,)
-    goal_norm   = goal_t.norm() + 1e-8
-    align       = (U_b * goal_t.unsqueeze(0).unsqueeze(0)).sum(-1)  # (N, H)
-    align_cost  = (1.0 - align / goal_norm).mean(-1)                # (N,), in [0, 2]
-
-    total = SAFETY_W * safety_cost + GOAL_W * align_cost
-
-    beta    = total.min()
-    weights = torch.exp(-(total - beta) / TEMPERATURE)
+    beta    = safety_cost.min()
+    weights = torch.exp(-(safety_cost - beta) / TEMPERATURE)
     weights = weights / (weights.sum() + 1e-8)
 
     U_warm = (weights[:, None, None] * U_b).sum(0).clamp(-1, 1)
     action = U_warm[0].clone()
     U_warm = torch.roll(U_warm, -1, dims=0)
-    U_warm[-1] = goal_bias
+    U_warm[-1].zero_()
+    return action, U_warm
+
+
+def safe_goal_action(z_hist_deque, U_warm, goal_dir_action, current_score):
+    """
+    Blended safe-goal controller (SLS²-style):
+      - When safe (score >> threshold): go straight toward goal.
+      - When near/in hazard (score ≈ threshold): blend in MPPI escape action.
+      - When deeply unsafe: pure MPPI escape.
+
+    The blend weight λ goes from 0 (safe→goal) to 1 (unsafe→escape) smoothly.
+    """
+    goal_t = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
+
+    # λ = sigmoid(-k * margin): 0 when well inside safe region, 1 when unsafe
+    margin = current_score - safe_threshold   # positive = safe
+    lam    = float(torch.sigmoid(torch.tensor(-margin * 3.0)))   # k=3 controls sharpness
+
+    if lam < 0.05:
+        # Fully safe: go straight toward goal, no MPPI needed
+        action = goal_t.clamp(-1, 1)
+        return action, U_warm
+
+    # Compute MPPI escape action
+    mppi_action, U_warm = mppi_safe_escape(z_hist_deque, U_warm)
+
+    # Blend: λ=0 → pure goal, λ=1 → pure MPPI
+    action = ((1 - lam) * goal_t + lam * mppi_action).clamp(-1, 1)
     return action, U_warm
 
 
@@ -270,7 +284,7 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = mppi_step(z_hist_deque, U_warm, goal_dir)
+                action, U_warm = safe_goal_action(z_hist_deque, U_warm, goal_dir, score)
             action_np = action.cpu().numpy()
         else:
             action_np = env.action_space.sample()
