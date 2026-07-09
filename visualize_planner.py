@@ -104,35 +104,52 @@ def get_safety_score(z):
     with torch.no_grad():
         return clf(z_n).item()
 
-def mppi_step(z_hist_deque, U_warm):
+def get_goal_direction(raw_env):
+    """
+    Extract goal direction from environment internal state.
+    Returns (dx, dy) unit vector pointing from agent toward goal, in world frame.
+    """
+    try:
+        u = raw_env.unwrapped
+        agent_pos = np.array(u.agent.pos[:2])    # (x, y)
+        goal_pos  = np.array(u.task.goal.pos[:2])
+        delta = goal_pos - agent_pos
+        dist  = np.linalg.norm(delta) + 1e-8
+        return delta / dist, dist
+    except Exception:
+        return np.zeros(2), 999.0
+
+
+def mppi_step(z_hist_deque, U_warm, goal_dir_action):
     """
     One MPPI planning step.
     z_hist_deque: deque of (D,) tensors, length HISTORY
     U_warm: (HORIZON, A) warm-start action tensor
+    goal_dir_action: (A,) numpy — base action pointing toward goal
     Returns: (A,) action, updated U_warm
     """
     z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0).expand(N_SAMPLES, -1, -1)
-    # Goal: center of safe latent distribution (zero in normalized space ≈ mean latent)
-    # We use the safe cluster center — pull toward low-norm latents to stay safe
-    z_goal = torch.zeros(1, model.cfg.z_dim, device=DEVICE)
 
-    noise = torch.randn(N_SAMPLES, HORIZON, cfg.action_dim, device=DEVICE)
-    U_b   = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
+    # Warm-start centered on goal direction: bias samples toward the goal
+    goal_bias = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
+    noise = torch.randn(N_SAMPLES, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
+    # Each sampled sequence starts from goal direction + noise
+    U_b = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
+    # Also bias half the samples directly toward goal to encourage exploration
+    U_b[:N_SAMPLES//2] = (goal_bias.unsqueeze(0).unsqueeze(0) + noise[:N_SAMPLES//2]).clamp(-1, 1)
 
     z_seq    = model.rollout(z_hist, U_b, HISTORY)
     z_rolled = z_seq[:, -HORIZON:, :]   # (N, H, D)
 
-    # Goal cost
-    goal_cost = (z_rolled[:, -1, :] - z_goal).pow(2).sum(-1)
-
-    # Safety cost
+    # Safety cost — penalize predicted unsafe states
     z_flat   = z_rolled.reshape(N_SAMPLES * HORIZON, -1)
     z_flat_n = (z_flat - z_mean) / z_std
-    scores   = clf(z_flat_n)                                   # (N*H,)
+    scores   = clf(z_flat_n)
     pen      = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
     safety_cost = pen.reshape(N_SAMPLES, HORIZON).sum(-1)
 
-    total = goal_cost + SAFETY_W * safety_cost
+    # Total cost: only safety (goal handled by bias + warm-start toward goal dir)
+    total = SAFETY_W * safety_cost
     beta    = total.min()
     weights = torch.exp(-(total - beta) / TEMPERATURE)
     weights = weights / (weights.sum() + 1e-8)
@@ -140,7 +157,7 @@ def mppi_step(z_hist_deque, U_warm):
     U_warm = (weights[:, None, None] * U_b).sum(0).clamp(-1, 1)
     action = U_warm[0].clone()
     U_warm = torch.roll(U_warm, -1, dims=0)
-    U_warm[-1] = 0.0
+    U_warm[-1] = goal_bias   # next warm-start seeds from goal direction
     return action, U_warm
 
 
@@ -177,9 +194,10 @@ def run_episode(env, use_planner=False, seed=SEED):
         z_hist_deque.append(z0)
 
     for step in range(MAX_STEPS):
-        # Current safety score
+        # Current safety score and goal direction
         z_cur = get_z(obs)
         score = get_safety_score(z_cur)
+        goal_dir, goal_dist = get_goal_direction(env.env)
 
         # High-res overhead frame from viz env
         raw_viz = viz_env.render()   # (256, 256, 3) uint8, fixedfar camera
@@ -188,8 +206,9 @@ def run_episode(env, use_planner=False, seed=SEED):
             frame = raw_viz.copy()
             safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
             color = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
-            cv2.putText(frame, f"t={step:3d}", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-            cv2.putText(frame, safe_str,       (6, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            cv2.putText(frame, f"t={step:3d}",          (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.putText(frame, safe_str,                 (6, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(frame, f"goal:{goal_dist:.2f}m", (6, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,80), 1)
         except ImportError:
             frame = raw_viz
         frames.append(frame)
@@ -198,7 +217,7 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = mppi_step(z_hist_deque, U_warm)
+                action, U_warm = mppi_step(z_hist_deque, U_warm, goal_dir)
             action_np = action.cpu().numpy()
         else:
             action_np = env.action_space.sample()
