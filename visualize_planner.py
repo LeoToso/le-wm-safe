@@ -144,9 +144,27 @@ def mppi_step(z_hist_deque, U_warm):
     return action, U_warm
 
 
+def make_viz_env(seed):
+    """Separate high-res env with fixedfar overhead camera for recording GIFs."""
+    import safety_gymnasium
+    viz = safety_gymnasium.make(
+        cfg.env_name,
+        render_mode="rgb_array",
+        camera_name="fixedfar",
+        width=256,
+        height=256,
+    )
+    viz.reset(seed=seed)
+    return viz
+
+
 def run_episode(env, use_planner=False, seed=SEED):
     """Run one episode, return frames, costs, safety scores."""
     obs = env.reset()
+
+    # Second env just for rendering — same seed so state is identical
+    viz_env = make_viz_env(seed)
+
     frames, costs, scores = [], [], []
 
     from collections import deque
@@ -163,13 +181,17 @@ def run_episode(env, use_planner=False, seed=SEED):
         z_cur = get_z(obs)
         score = get_safety_score(z_cur)
 
-        # Record pixel frame with overlay
-        raw = denorm(obs[:3])
+        # High-res overhead frame from viz env
+        raw_viz = viz_env.render()   # (256, 256, 3) uint8, fixedfar camera
         try:
             import cv2
-            frame = add_overlay(raw, 0, score, safe_threshold, step)
+            frame = raw_viz.copy()
+            safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
+            color = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
+            cv2.putText(frame, f"t={step:3d}", (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
+            cv2.putText(frame, safe_str,       (6, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
         except ImportError:
-            frame = raw
+            frame = raw_viz
         frames.append(frame)
         scores.append(score)
 
@@ -182,13 +204,14 @@ def run_episode(env, use_planner=False, seed=SEED):
             action_np = env.action_space.sample()
 
         next_obs, r, c, done, _ = env.step(action_np)
+        viz_env.step(action_np)   # keep viz env in sync
 
-        # Overlay cost on frame after step (we now know if we hit something)
+        # Red border overlay on cost steps
         costs.append(c)
         if c > 0:
-            # Re-draw with red border
             try:
-                frame = add_overlay(raw, c, score, safe_threshold, step)
+                import cv2
+                cv2.rectangle(frame, (0, 0), (255, 255), (255, 0, 0), 5)
                 frames[-1] = frame
             except Exception:
                 pass
@@ -270,8 +293,8 @@ try:
         rnd_label  = np.zeros((label_h, W, 3), dtype=np.uint8)
         mppi_label = np.zeros((label_h, W, 3), dtype=np.uint8)
         try:
-            cv2.putText(rnd_label,  "RANDOM",    (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,200), 1)
-            cv2.putText(mppi_label, "MPPI-SAFE", (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100,220,100), 1)
+            cv2.putText(rnd_label,  "RANDOM",    (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
+            cv2.putText(mppi_label, "MPPI-SAFE", (5, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100,220,100), 1)
         except Exception:
             pass
         rnd_col  = np.vstack([rnd_label,  rnd_f])
