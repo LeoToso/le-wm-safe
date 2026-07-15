@@ -273,6 +273,12 @@ def run_episode(env, use_planner=False, seed=SEED):
             with torch.no_grad():
                 action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score)
             action_np = action.cpu().numpy()
+            # Debug every 10 steps
+            if step % 10 == 0:
+                branch = "STRAIGHT" if score >= safe_threshold + SAFETY_MARGIN else "MPPI"
+                print(f"    [dbg] step={step:3d} | score={score:+.3f} | branch={branch} "
+                      f"| goal_dist={goal_dist:.2f}m | action=({action_np[0]:+.2f},{action_np[1]:+.2f}) "
+                      f"| goal_dir=({goal_dir[0]:+.2f},{goal_dir[1]:+.2f})")
         else:
             action_np = env.action_space.sample()
 
