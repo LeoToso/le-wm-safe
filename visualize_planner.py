@@ -188,19 +188,23 @@ def get_goal_direction(raw_env, wrapper=None):
     return (raw / norm if norm > 1.0 else raw), dist
 
 
-def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
+def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0):
     """
-    SLS²-style safe-goal controller with hard reactive switch:
-      - SAFE  (current_score >= threshold + margin): go straight to goal.
-      - UNSAFE (current_score <  threshold + margin): MPPI escape biased toward goal.
+    Reactive-predictive safe-goal controller:
+      - SAFE: go straight to goal (PD action from get_goal_direction).
+      - UNSAFE: MPPI escape biased toward goal.
 
-    Using the CURRENT score (not predicted future) avoids over-conservative
-    blocking caused by the goal being near hazards in the latent space. The agent
-    charges toward the goal until the classifier detects an actual hazard, then dodges.
+    MPPI is triggered reactively (actual hazard contact) or when the world
+    model is very confident the current state is unsafe (score < -1.5).
+    Using actual cost avoids false-positive triggers from world-model calibration
+    errors that would send the agent on destructive detours away from the goal.
     """
     goal_t = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
 
-    if current_score >= safe_threshold + SAFETY_MARGIN:
+    # Trigger MPPI only on real hazard contact or very confident unsafe prediction
+    MPPI_SCORE_THRESHOLD = safe_threshold - 1.5  # = -1.5: very conservative
+    use_mppi = (recent_cost > 0) or (current_score < MPPI_SCORE_THRESHOLD)
+    if not use_mppi:
         # Safe: go straight to goal at full speed
         return goal_t.clamp(-1, 1), U_warm
 
@@ -279,6 +283,7 @@ def run_episode(env, use_planner=False, seed=SEED):
     print(f"  Start: {start_xy}  px={sp}")
     print(f"  Goal:  {goal_xy}   px={gp}  dist={goal_dist_start:.2f}m")
 
+    prev_cost = 0  # cost from previous env.step; used as reactive MPPI trigger
     for step in range(MAX_STEPS):
         z_cur = get_z(obs)
         score = get_safety_score(z_cur)
@@ -316,11 +321,12 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score)
+                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost)
             action_np = action.cpu().numpy()
             # Debug every 10 steps
             if step % 5 == 0:
-                branch = "STRAIGHT" if score >= safe_threshold + SAFETY_MARGIN else "MPPI"
+                MPPI_SCORE_THRESHOLD = safe_threshold - 1.5
+                branch = "MPPI" if (prev_cost > 0 or score < MPPI_SCORE_THRESHOLD) else "STRAIGHT"
                 a_xy, g_xy, _ = get_agent_goal_pos(env.env)
                 print(f"    [dbg] step={step:3d} | branch={branch} | dist={goal_dist:.3f}m"
                       f" | agent=({a_xy[0]:+.3f},{a_xy[1]:+.3f})"
@@ -331,6 +337,7 @@ def run_episode(env, use_planner=False, seed=SEED):
 
         next_obs, r, c, done, _ = env.step(action_np)
         viz_env.step(action_np)
+        prev_cost = c
 
         costs.append(c)
         if c > 0:
