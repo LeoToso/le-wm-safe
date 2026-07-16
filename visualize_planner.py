@@ -174,8 +174,9 @@ def get_goal_direction(raw_env, wrapper=None):
     world_dir = (goal_xy - agent_xy) / dist  # proportional (unit vector)
 
     # Derivative term: subtract scaled current velocity to dampen overshoot.
-    # For a freejoint, qvel[0:2] are translational velocities in world frame.
-    K_D = 1.0
+    # When very close to goal, drop damping so the robot punches through
+    # the goal threshold rather than spiraling past it.
+    K_D = 0.0 if dist < 0.55 else 0.5
     try:
         u   = raw_env.unwrapped
         vel = np.array(u.task.data.qvel[:2], dtype=np.float64)
