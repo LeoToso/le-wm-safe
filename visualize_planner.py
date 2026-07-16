@@ -175,7 +175,7 @@ def get_goal_direction(raw_env, wrapper=None):
 
     # Derivative term: subtract scaled current velocity to dampen overshoot.
     # For a freejoint, qvel[0:2] are translational velocities in world frame.
-    K_D = 0.5
+    K_D = 1.0
     try:
         u   = raw_env.unwrapped
         vel = np.array(u.task.data.qvel[:2], dtype=np.float64)
