@@ -159,12 +159,33 @@ def get_robot_heading(raw_env):
 
 
 def get_goal_direction(raw_env, wrapper=None):
-    """Return unit vector toward the goal in world frame, and the distance."""
+    """
+    Return a PD goal-tracking action (world frame) and the distance.
+
+    The Point robot has force actuators (not velocity), so a pure
+    proportional controller overshoots.  We add a damping term using
+    the freejoint world-frame velocity (qvel[0:2]) to brake the robot
+    before it overshoots.
+    """
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
     if dist >= 990:
         return np.zeros(2), 999.0
-    world_dir = (goal_xy - agent_xy) / dist
-    return world_dir, dist
+
+    world_dir = (goal_xy - agent_xy) / dist  # proportional (unit vector)
+
+    # Derivative term: subtract scaled current velocity to dampen overshoot.
+    # For a freejoint, qvel[0:2] are translational velocities in world frame.
+    K_D = 0.5
+    try:
+        u   = raw_env.unwrapped
+        vel = np.array(u.task.data.qvel[:2], dtype=np.float64)
+        raw = world_dir - K_D * vel
+    except Exception:
+        raw = world_dir
+
+    # Clamp to action bounds without changing direction
+    norm = float(np.linalg.norm(raw))
+    return (raw / norm if norm > 1.0 else raw), dist
 
 
 def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
