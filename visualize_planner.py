@@ -201,9 +201,10 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     """
     goal_t = torch.tensor(goal_dir_action, dtype=torch.float32, device=DEVICE)
 
-    # Trigger MPPI only on real hazard contact or very confident unsafe prediction
-    MPPI_SCORE_THRESHOLD = safe_threshold - 1.5  # = -1.5: very conservative
-    use_mppi = (recent_cost > 0) or (current_score < MPPI_SCORE_THRESHOLD)
+    # Trigger MPPI ONLY on actual hazard contact.
+    # Score-based triggers fire on world-model false positives far from any real hazard,
+    # trapping the robot in long MPPI spirals away from the goal.
+    use_mppi = (recent_cost > 0)
     if not use_mppi:
         # Safe: go straight to goal at full speed
         return goal_t.clamp(-1, 1), U_warm
@@ -325,8 +326,7 @@ def run_episode(env, use_planner=False, seed=SEED):
             action_np = action.cpu().numpy()
             # Debug every 10 steps
             if step % 5 == 0:
-                MPPI_SCORE_THRESHOLD = safe_threshold - 1.5
-                branch = "MPPI" if (prev_cost > 0 or score < MPPI_SCORE_THRESHOLD) else "STRAIGHT"
+                branch = "MPPI" if prev_cost > 0 else "STRAIGHT"
                 a_xy, g_xy, _ = get_agent_goal_pos(env.env)
                 heading_deg = float(np.degrees(get_robot_heading(env.env)))
                 try:
