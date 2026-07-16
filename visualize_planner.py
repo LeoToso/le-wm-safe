@@ -158,41 +158,53 @@ def get_robot_heading(raw_env):
     return 0.0
 
 
+def get_agent_heading(raw_env):
+    """Return the agent's current world-frame heading in radians."""
+    try:
+        u = raw_env.unwrapped
+        agent_id = u.task.model.body('agent').id
+        xquat = np.array(u.task.data.xquat[agent_id])  # (qw, qx, qy, qz)
+        return float(2.0 * np.arctan2(xquat[3], xquat[0]))
+    except Exception:
+        return 0.0
+
+
 def get_goal_direction(raw_env, wrapper=None):
     """
-    Return a body-frame action that drives toward the goal with PD damping.
+    Unicycle controller for the PointRobot.
 
-    Steps:
-      1. Compute desired world-frame force: F_world = world_dir - K_D * vel_world
-      2. Convert vel_body → vel_world using robot heading
-      3. Convert F_world → body-frame action using R^T
-    This is heading-invariant, unlike the previous mixed-frame approach.
+    The PointRobot has body-frame actuation:
+      - action[0]: forward/backward force in current heading direction
+      - action[1]: angular velocity (turns the body)
+
+    Controller:
+      - Compute angle to goal (alpha) and heading error (delta = alpha - theta)
+      - action[0] = cos(delta): full forward when facing goal, brakes when facing away
+      - action[1] = k_turn * sin(delta): turn toward goal
+      - Scale by distance to slow down near goal
+
+    This is a pure proportional controller — MuJoCo's joint damping provides
+    natural dissipation and prevents infinite oscillation.
     """
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
     if dist >= 990:
         return np.zeros(2), 999.0
 
-    world_dir = (goal_xy - agent_xy) / dist  # unit vector toward goal in world frame
+    alpha = float(np.arctan2(goal_xy[1] - agent_xy[1], goal_xy[0] - agent_xy[0]))
+    theta = get_agent_heading(raw_env)
+    delta = alpha - theta
+    # Normalize to [-pi, pi]
+    delta = (delta + np.pi) % (2 * np.pi) - np.pi
 
-    # Drop damping when very close so the robot punches through the threshold.
-    K_D = 0.0 if dist < 0.55 else 0.5
-    try:
-        u        = raw_env.unwrapped
-        heading  = get_robot_heading(raw_env)
-        c, s     = np.cos(heading), np.sin(heading)
-        R        = np.array([[c, -s], [s,  c]])   # body → world
-        vel_body = np.array(u.task.data.qvel[:2], dtype=np.float64)
-        vel_world = R @ vel_body                   # convert to world frame
-        F_world  = world_dir - K_D * vel_world     # PD in world frame
-        raw      = R.T @ F_world                   # convert to body-frame action
-    except Exception:
-        raw = world_dir
+    k_turn = 2.0   # turning gain (≥1 to turn aggressively toward goal)
+    speed  = min(1.0, dist)  # proportional to distance, max 1
 
-    norm = float(np.linalg.norm(raw))
-    return (raw / norm if norm > 1.0 else raw), dist
+    action = np.array([speed * np.cos(delta), k_turn * np.sin(delta)])
+    norm = float(np.linalg.norm(action))
+    return (action / norm if norm > 1.0 else action), dist
 
 
-def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0):
+def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0, goal_dist=999.0):
     """
     Reactive-predictive safe-goal controller:
       - SAFE: go straight to goal (PD action from get_goal_direction).
@@ -208,7 +220,14 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     # Trigger MPPI ONLY on actual hazard contact.
     # Score-based triggers fire on world-model false positives far from any real hazard,
     # trapping the robot in long MPPI spirals away from the goal.
-    use_mppi = (recent_cost > 0)
+    # Don't activate MPPI if the robot is already close to the goal — at that range
+    # MPPI escape actions overshoot and push the robot far away.  Trust the PD
+    # controller to navigate the last stretch (it will incur some cost but will
+    # actually capture the goal, unlike MPPI which deflects away).
+    # Don't activate MPPI if the robot is close to the goal — MPPI escape actions
+    # at close range push the robot far away.  Trust the PD controller inside 1.2m
+    # (the orbit converges below 1.2m and will naturally reach capture distance).
+    use_mppi = (recent_cost > 0) and (goal_dist > 1.2)
     if not use_mppi:
         # Safe: go straight to goal at full speed
         return goal_t.clamp(-1, 1), U_warm
@@ -231,8 +250,7 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     pen         = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
     safety_cost = pen.reshape(N, HORIZON).sum(-1)
 
-    # Small goal-attraction cost: prefer escape paths that stay near goal direction.
-    # Prevents MPPI from drifting far from the goal while avoiding hazards.
+    # Goal-attraction cost: prefer escape paths that stay near the goal direction.
     GOAL_ALPHA  = 5.0
     goal_expand = goal_t.unsqueeze(0).unsqueeze(0)  # (1, 1, A)
     goal_cost   = ((U_b - goal_expand) ** 2).mean(-1).sum(-1)  # (N,)
@@ -326,7 +344,7 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost)
+                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost, goal_dist)
             action_np = action.cpu().numpy()
             # Debug every 10 steps
             if step % 5 == 0:
@@ -389,15 +407,16 @@ for trial_seed in range(SEED, SEED + N_SEARCH):
     init_safety = get_safety_score(z0_check)
     print(f"  seed={trial_seed}: goal_dist={init_dist:.2f}m, init_safety={init_safety:.2f}", end="")
 
-    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False, seed=trial_seed)
-    total = int(trial_costs.sum())
-    print(f" -> random cost={total}")
-
     # Require: agent spawns safely AND goal starts far; then prefer high random cost
     starts_safe = init_safety > 1.0    # agent doesn't spawn inside a hazard
     starts_far  = init_dist  > 1.5     # goal is not trivially close
     if not (starts_safe and starts_far):
+        print()  # newline after the seed line
         continue
+
+    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False, seed=trial_seed)
+    total = int(trial_costs.sum())
+    print(f" -> random cost={total}")
     if total > best_cost or best_rnd is None:
         best_cost      = total
         best_seed      = trial_seed
