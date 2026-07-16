@@ -159,26 +159,12 @@ def get_robot_heading(raw_env):
 
 
 def get_goal_direction(raw_env, wrapper=None):
-    """
-    Return the action (in robot body frame) that points toward the goal,
-    and the goal distance in metres.
-
-    The Point robot's freejoint lets it rotate freely; its actuators
-    control velocity in the body frame.  We must rotate the world-frame
-    goal direction by -heading to get the correct body-frame action.
-    """
+    """Return unit vector toward the goal in world frame, and the distance."""
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
     if dist >= 990:
         return np.zeros(2), 999.0
-
-    world_dir = (goal_xy - agent_xy) / dist  # unit vector in world frame
-
-    # Rotate into body frame:  action = R(-θ) @ world_dir
-    theta = get_robot_heading(raw_env)
-    c, s  = np.cos(theta), np.sin(theta)
-    body_dir = np.array([ c * world_dir[0] + s * world_dir[1],
-                          -s * world_dir[0] + c * world_dir[1]])
-    return body_dir, dist
+    world_dir = (goal_xy - agent_xy) / dist
+    return world_dir, dist
 
 
 def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
