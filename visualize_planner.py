@@ -328,9 +328,16 @@ def run_episode(env, use_planner=False, seed=SEED):
                 MPPI_SCORE_THRESHOLD = safe_threshold - 1.5
                 branch = "MPPI" if (prev_cost > 0 or score < MPPI_SCORE_THRESHOLD) else "STRAIGHT"
                 a_xy, g_xy, _ = get_agent_goal_pos(env.env)
+                heading_deg = float(np.degrees(get_robot_heading(env.env)))
+                try:
+                    _vel = np.array(env.env.unwrapped.task.data.qvel[:2], dtype=np.float64)
+                    vel_str = f"({_vel[0]:+.3f},{_vel[1]:+.3f})"
+                except Exception:
+                    vel_str = "(?,?)"
                 print(f"    [dbg] step={step:3d} | branch={branch} | dist={goal_dist:.3f}m"
                       f" | agent=({a_xy[0]:+.3f},{a_xy[1]:+.3f})"
                       f" | goal=({g_xy[0]:+.3f},{g_xy[1]:+.3f})"
+                      f" | hdg={heading_deg:+.0f}° | vel={vel_str}"
                       f" | action=({action_np[0]:+.3f},{action_np[1]:+.3f})")
         else:
             action_np = env.action_space.sample()
