@@ -35,7 +35,7 @@ N_SAMPLES     = int(os.environ.get("N_SAMPLES",  "64"))
 HORIZON       = int(os.environ.get("HORIZON",    "5"))
 TEMPERATURE   = float(os.environ.get("TEMPERATURE", "0.05"))
 SAFETY_W      = float(os.environ.get("SAFETY_W",    "20.0"))
-SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","0.5"))
+SAFETY_MARGIN = float(os.environ.get("SAFETY_MARGIN","-0.5"))
 HISTORY       = int(os.environ.get("HISTORY",    "3"))
 SEED          = int(os.environ.get("SEED",       "0"))
 N_SEARCH      = int(os.environ.get("N_SEARCH",   "15"))
@@ -224,7 +224,7 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
 
     # Small goal-attraction cost: prefer escape paths that stay near goal direction.
     # Prevents MPPI from drifting far from the goal while avoiding hazards.
-    GOAL_ALPHA  = 1.0
+    GOAL_ALPHA  = 5.0
     goal_expand = goal_t.unsqueeze(0).unsqueeze(0)  # (1, 1, A)
     goal_cost   = ((U_b - goal_expand) ** 2).mean(-1).sum(-1)  # (N,)
     total_cost  = safety_cost + GOAL_ALPHA * goal_cost
