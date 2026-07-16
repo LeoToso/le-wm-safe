@@ -222,8 +222,15 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
     pen         = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
     safety_cost = pen.reshape(N, HORIZON).sum(-1)
 
-    beta    = safety_cost.min()
-    weights = torch.exp(-(safety_cost - beta) / TEMPERATURE)
+    # Small goal-attraction cost: prefer escape paths that stay near goal direction.
+    # Prevents MPPI from drifting far from the goal while avoiding hazards.
+    GOAL_ALPHA  = 1.0
+    goal_expand = goal_t.unsqueeze(0).unsqueeze(0)  # (1, 1, A)
+    goal_cost   = ((U_b - goal_expand) ** 2).mean(-1).sum(-1)  # (N,)
+    total_cost  = safety_cost + GOAL_ALPHA * goal_cost
+
+    beta    = total_cost.min()
+    weights = torch.exp(-(total_cost - beta) / TEMPERATURE)
     weights = weights / (weights.sum() + 1e-8)
 
     U_warm = (weights[:, None, None] * U_b).sum(0).clamp(-1, 1)
