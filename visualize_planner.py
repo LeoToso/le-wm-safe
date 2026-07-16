@@ -160,31 +160,34 @@ def get_robot_heading(raw_env):
 
 def get_goal_direction(raw_env, wrapper=None):
     """
-    Return a PD goal-tracking action (world frame) and the distance.
+    Return a body-frame action that drives toward the goal with PD damping.
 
-    The Point robot has force actuators (not velocity), so a pure
-    proportional controller overshoots.  We add a damping term using
-    the freejoint world-frame velocity (qvel[0:2]) to brake the robot
-    before it overshoots.
+    Steps:
+      1. Compute desired world-frame force: F_world = world_dir - K_D * vel_world
+      2. Convert vel_body → vel_world using robot heading
+      3. Convert F_world → body-frame action using R^T
+    This is heading-invariant, unlike the previous mixed-frame approach.
     """
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
     if dist >= 990:
         return np.zeros(2), 999.0
 
-    world_dir = (goal_xy - agent_xy) / dist  # proportional (unit vector)
+    world_dir = (goal_xy - agent_xy) / dist  # unit vector toward goal in world frame
 
-    # Derivative term: subtract scaled current velocity to dampen overshoot.
-    # When very close to goal, drop damping so the robot punches through
-    # the goal threshold rather than spiraling past it.
+    # Drop damping when very close so the robot punches through the threshold.
     K_D = 0.0 if dist < 0.55 else 0.5
     try:
-        u   = raw_env.unwrapped
-        vel = np.array(u.task.data.qvel[:2], dtype=np.float64)
-        raw = world_dir - K_D * vel
+        u        = raw_env.unwrapped
+        heading  = get_robot_heading(raw_env)
+        c, s     = np.cos(heading), np.sin(heading)
+        R        = np.array([[c, -s], [s,  c]])   # body → world
+        vel_body = np.array(u.task.data.qvel[:2], dtype=np.float64)
+        vel_world = R @ vel_body                   # convert to world frame
+        F_world  = world_dir - K_D * vel_world     # PD in world frame
+        raw      = R.T @ F_world                   # convert to body-frame action
     except Exception:
         raw = world_dir
 
-    # Clamp to action bounds without changing direction
     norm = float(np.linalg.norm(raw))
     return (raw / norm if norm > 1.0 else raw), dist
 
