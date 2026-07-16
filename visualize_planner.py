@@ -142,12 +142,43 @@ def get_agent_goal_pos(raw_env):
         return np.zeros(2), np.zeros(2), 999.0
 
 
+def get_robot_heading(raw_env):
+    """
+    Return the robot's yaw angle (radians) from its freejoint quaternion.
+    qpos layout for a freejoint: [x, y, z, qw, qx, qy, qz, ...].
+    """
+    try:
+        u = raw_env.unwrapped
+        qpos = np.array(u.task.data.qpos)
+        if len(qpos) >= 7:
+            qw, qz = float(qpos[3]), float(qpos[6])
+            return 2.0 * np.arctan2(qz, qw)
+    except Exception:
+        pass
+    return 0.0
+
+
 def get_goal_direction(raw_env, wrapper=None):
-    """(dx, dy) unit vector toward goal from agent, and goal distance in metres."""
+    """
+    Return the action (in robot body frame) that points toward the goal,
+    and the goal distance in metres.
+
+    The Point robot's freejoint lets it rotate freely; its actuators
+    control velocity in the body frame.  We must rotate the world-frame
+    goal direction by -heading to get the correct body-frame action.
+    """
     agent_xy, goal_xy, dist = get_agent_goal_pos(raw_env)
-    if dist < 990:
-        return (goal_xy - agent_xy) / dist, dist
-    return np.zeros(2), 999.0
+    if dist >= 990:
+        return np.zeros(2), 999.0
+
+    world_dir = (goal_xy - agent_xy) / dist  # unit vector in world frame
+
+    # Rotate into body frame:  action = R(-θ) @ world_dir
+    theta = get_robot_heading(raw_env)
+    c, s  = np.cos(theta), np.sin(theta)
+    body_dir = np.array([ c * world_dir[0] + s * world_dir[1],
+                          -s * world_dir[0] + c * world_dir[1]])
+    return body_dir, dist
 
 
 def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score):
