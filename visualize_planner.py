@@ -390,18 +390,18 @@ for trial_seed in range(SEED, SEED + N_SEARCH):
     total = int(trial_costs.sum())
     print(f" -> random cost={total}")
 
-    # Prefer seeds where: random hits hazards, goal starts far, agent doesn't spawn IN a hazard
-    starts_safe = init_safety > 1.0    # agent spawns away from hazards
-    starts_far  = init_dist  > 2.5     # goal is not immediately next to agent
-    rank = total * 2 + starts_far + starts_safe
-    best_rank = best_cost * 2 + (best_goal_dist > 2.5) + 1
-    if rank > best_rank or best_rnd is None:
+    # Require: agent spawns safely AND goal starts far; then prefer high random cost
+    starts_safe = init_safety > 1.0    # agent doesn't spawn inside a hazard
+    starts_far  = init_dist  > 1.5     # goal is not trivially close
+    if not (starts_safe and starts_far):
+        continue
+    if total > best_cost or best_rnd is None:
         best_cost      = total
         best_seed      = trial_seed
         best_rnd       = (trial_frames, trial_costs, trial_scores)
         best_goal_dist = init_dist
 
-    if best_cost >= 5 and starts_far and starts_safe:
+    if best_cost >= 5:
         break
 
 if best_rnd is None:
