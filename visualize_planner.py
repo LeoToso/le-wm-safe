@@ -1,11 +1,11 @@
 """
-Visualize MPPI planner trajectories vs random policy.
+Visualize MPPI planner: without regularization (rho=0) vs with regularization (rho=1).
 
 Records pixel frames from the live environment and saves:
-  - side_by_side.gif : random (left) vs MPPI-safe (right)
-  - random_traj.gif  : random policy alone
-  - mppi_traj.gif    : MPPI planner alone
-  - comparison.png   : cost & safety score over time
+  - side_by_side.gif   : without reg (left) vs with reg (right)
+  - noreg_traj.gif     : without regularization alone
+  - reg_traj.gif       : with regularization alone
+  - comparison.png     : cost & safety score over time
 
 Usage:
     MUJOCO_GL=osmesa python visualize_planner.py
@@ -27,7 +27,8 @@ from safe_lewm.classifier import ObstacleMLP
 from safe_lewm.env_utils import SafetyGymWrapper
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHECKPOINT    = os.environ.get("CHECKPOINT",  "/mnt/t7shield/safe_lewm_rho1.pt")
+CHECKPOINT    = os.environ.get("CHECKPOINT",       "/mnt/t7shield/safe_lewm_rho1.pt")
+CHECKPOINT_NOREG = os.environ.get("CHECKPOINT_NOREG", "/mnt/t7shield/safe_lewm_rho0.pt")
 CLF_PATH      = os.environ.get("CLF_PATH",    "/mnt/t7shield/classifier.pt")
 OUT_DIR       = Path(os.environ.get("OUT_DIR", "planner_viz"))
 MAX_STEPS     = int(os.environ.get("MAX_STEPS",  "500"))
@@ -92,13 +93,21 @@ def draw_marker(frame, px, py, color, label, radius=8):
     return frame
 
 
-# ── Load model ─────────────────────────────────────────────────────────────────
-print("Loading world model...")
+# ── Load models ────────────────────────────────────────────────────────────────
 cfg = Config()
+
+print("Loading world model (with regularization, rho=1)...")
 model = SafeJEPA(cfg).to(DEVICE)
 model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE, weights_only=False))
 model.eval()
 for p in model.parameters():
+    p.requires_grad_(False)
+
+print("Loading world model (without regularization, rho=0)...")
+model_noreg = SafeJEPA(cfg).to(DEVICE)
+model_noreg.load_state_dict(torch.load(CHECKPOINT_NOREG, map_location=DEVICE, weights_only=False))
+model_noreg.eval()
+for p in model_noreg.parameters():
     p.requires_grad_(False)
 
 # ── Load classifier ───────────────────────────────────────────────────────────
@@ -116,11 +125,12 @@ safe_threshold = ckpt["safe_threshold"]
 print(f"  Conformal threshold: {safe_threshold:.4f}")
 
 
-def get_z(obs_np):
+def get_z(obs_np, world_model=None):
     """Encode (C, H, W) numpy obs → (D,) latent tensor."""
+    m = world_model if world_model is not None else model
     x = torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        return model.encoder(x).squeeze(0)
+        return m.encoder(x).squeeze(0)
 
 
 def get_safety_score(z):
@@ -204,7 +214,7 @@ def get_goal_direction(raw_env, wrapper=None):
     return (action / norm if norm > 1.0 else action), dist
 
 
-def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0, goal_dist=999.0):
+def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0, goal_dist=999.0, world_model=None):
     """
     Reactive-predictive safe-goal controller:
       - SAFE: go straight to goal (PD action from get_goal_direction).
@@ -242,7 +252,8 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     U_b  = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
     U_b[:N // 2] = (goal_t.unsqueeze(0).unsqueeze(0) + noise[:N // 2]).clamp(-1, 1)
 
-    z_seq    = model.rollout(z_h, U_b, HISTORY)
+    m = world_model if world_model is not None else model
+    z_seq    = m.rollout(z_h, U_b, HISTORY)
     z_rolled = z_seq[:, -HORIZON:, :].reshape(N * HORIZON, -1)
     z_flat_n = (z_rolled - z_mean) / z_std
     scores   = clf(z_flat_n)
@@ -285,7 +296,7 @@ def make_viz_env(seed):
     return viz
 
 
-def run_episode(env, use_planner=False, seed=SEED):
+def run_episode(env, use_planner=False, seed=SEED, world_model=None):
     """Run one episode; return (frames, costs, scores)."""
     obs = env.reset()
     viz_env = make_viz_env(seed)
@@ -294,7 +305,7 @@ def run_episode(env, use_planner=False, seed=SEED):
 
     z_hist_deque = deque(maxlen=HISTORY)
     U_warm = torch.zeros(HORIZON, cfg.action_dim, device=DEVICE)
-    z0 = get_z(obs)
+    z0 = get_z(obs, world_model)
     for _ in range(HISTORY):
         z_hist_deque.append(z0)
 
@@ -312,7 +323,7 @@ def run_episode(env, use_planner=False, seed=SEED):
 
     prev_cost = 0  # cost from previous env.step; used as reactive MPPI trigger
     for step in range(MAX_STEPS):
-        z_cur = get_z(obs)
+        z_cur = get_z(obs, world_model)
         score = get_safety_score(z_cur)
         goal_dir, goal_dist = get_goal_direction(env.env)
 
@@ -344,7 +355,7 @@ def run_episode(env, use_planner=False, seed=SEED):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost, goal_dist)
+                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost, goal_dist, world_model)
             action_np = action.cpu().numpy()
             # Debug every 10 steps
             if step % 5 == 0:
@@ -377,11 +388,11 @@ def run_episode(env, use_planner=False, seed=SEED):
             except Exception:
                 pass
 
-        z_hist_deque.append(get_z(next_obs))
+        z_hist_deque.append(get_z(next_obs, world_model))
         obs = next_obs
 
         if step % 20 == 0:
-            tag = "MPPI" if use_planner else "Random"
+            tag = "WithReg" if use_planner else "NoReg"
             print(f"  [{tag}] step {step:3d} | score={score:+.3f} | cost={int(c)} | cumcost={int(sum(costs))}")
 
         if done:
@@ -390,61 +401,47 @@ def run_episode(env, use_planner=False, seed=SEED):
     return frames, np.array(costs), np.array(scores)
 
 
-# ── Search for a seed with: random policy hits hazards AND goal starts far away ─
-print(f"\nSearching for good seed (cost>0 and initial goal_dist>2m) ...")
+# ── Search for a good seed (goal starts far, agent spawns safely) ──────────────
+print(f"\nSearching for good seed (initial goal_dist>1.5m, safe spawn) ...")
 best_seed    = SEED
-best_cost    = 0
-best_rnd     = None
 best_goal_dist = 0.0
 
 for trial_seed in range(SEED, SEED + N_SEARCH):
     env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                                   cfg.frame_skip, seed=trial_seed)
     env_trial.env.unwrapped.task.hazards.num = NUM_HAZARDS
-    # Check initial goal distance and current safety score before running full episode
     env_trial.reset()
     _, _, init_dist = get_agent_goal_pos(env_trial.env)
-    z0_check = get_z(env_trial._get_stacked_obs() if hasattr(env_trial, '_get_stacked_obs') else env_trial.reset())
+    z0_check = get_z(env_trial._get_stacked_obs() if hasattr(env_trial, '_get_stacked_obs') else env_trial.reset(), model_noreg)
     init_safety = get_safety_score(z0_check)
-    print(f"  seed={trial_seed}: goal_dist={init_dist:.2f}m, init_safety={init_safety:.2f}", end="")
+    print(f"  seed={trial_seed}: goal_dist={init_dist:.2f}m, init_safety={init_safety:.2f}")
 
-    # Require: agent spawns safely AND goal starts far; then prefer high random cost
-    starts_safe = init_safety > 1.0    # agent doesn't spawn inside a hazard
-    starts_far  = init_dist  > 1.5     # goal is not trivially close
-    if not (starts_safe and starts_far):
-        print()  # newline after the seed line
-        continue
-
-    trial_frames, trial_costs, trial_scores = run_episode(env_trial, use_planner=False, seed=trial_seed)
-    total = int(trial_costs.sum())
-    print(f" -> random cost={total}")
-    if total > best_cost or best_rnd is None:
-        best_cost      = total
+    starts_safe = init_safety > 1.0
+    starts_far  = init_dist  > 1.5
+    if starts_safe and starts_far:
         best_seed      = trial_seed
-        best_rnd       = (trial_frames, trial_costs, trial_scores)
         best_goal_dist = init_dist
-
-    if best_cost >= 5:
         break
 
-if best_rnd is None:
-    best_rnd = (trial_frames, trial_costs, trial_scores)
+print(f"\nUsing seed={best_seed}, initial goal_dist={best_goal_dist:.2f}m")
 
-print(f"\nBest seed={best_seed}: random cost={best_cost}, initial goal_dist={best_goal_dist:.2f}m")
-rnd_frames, rnd_costs, rnd_scores = best_rnd
+# ── Run without-regularization episode ────────────────────────────────────────
+print(f"\n{'='*50}")
+print(f"Running WITHOUT regularization (rho=0, seed={best_seed})...")
+env_noreg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
+                              cfg.frame_skip, seed=best_seed)
+env_noreg.env.unwrapped.task.hazards.num = NUM_HAZARDS
+noreg_frames, noreg_costs, noreg_scores = run_episode(env_noreg, use_planner=True, seed=best_seed, world_model=model_noreg)
+print(f"  Total cost: {int(noreg_costs.sum())} | Steps: {len(noreg_costs)}")
 
-# ── Run MPPI episode with best seed ───────────────────────────────────────────
-env_mppi = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
-                             cfg.frame_skip, seed=best_seed)
-env_mppi.env.unwrapped.task.hazards.num = NUM_HAZARDS
+# ── Run with-regularization episode ───────────────────────────────────────────
+env_reg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
+                            cfg.frame_skip, seed=best_seed)
+env_reg.env.unwrapped.task.hazards.num = NUM_HAZARDS
 
 print(f"\n{'='*50}")
-print(f"Random policy (seed={best_seed}) — total cost: {int(rnd_costs.sum())} | Steps: {len(rnd_costs)}")
-
-print(f"\n{'='*50}")
-print(f"Running MPPI-SAFE planner (seed={best_seed})...")
-mppi_frames, mppi_costs, mppi_scores = run_episode(env_mppi, use_planner=True, seed=best_seed)
-print(f"  Total cost: {int(mppi_costs.sum())} | Steps: {len(mppi_costs)}")
+print(f"Running WITH regularization (rho=1, seed={best_seed})...")
+reg_frames, reg_costs, reg_scores = run_episode(env_reg, use_planner=True, seed=best_seed, world_model=model)
 
 # ── Save GIFs ─────────────────────────────────────────────────────────────────
 try:
@@ -452,27 +449,27 @@ try:
     import cv2
     print("\nSaving GIFs...")
 
-    imageio.mimsave(str(OUT_DIR / "random_traj.gif"),  rnd_frames,  fps=FPS)
-    imageio.mimsave(str(OUT_DIR / "mppi_traj.gif"),    mppi_frames, fps=FPS)
-    print(f"  Saved {OUT_DIR}/random_traj.gif")
-    print(f"  Saved {OUT_DIR}/mppi_traj.gif")
+    imageio.mimsave(str(OUT_DIR / "noreg_traj.gif"), noreg_frames, fps=FPS)
+    imageio.mimsave(str(OUT_DIR / "reg_traj.gif"),   reg_frames,   fps=FPS)
+    print(f"  Saved {OUT_DIR}/noreg_traj.gif")
+    print(f"  Saved {OUT_DIR}/reg_traj.gif")
 
     # Side-by-side GIF
-    n = min(len(rnd_frames), len(mppi_frames))
+    n = min(len(noreg_frames), len(reg_frames))
     label_h = 22
     side_frames = []
     for i in range(n):
-        rnd_f  = rnd_frames[i]
-        mppi_f = mppi_frames[i]
-        H, W, _ = rnd_f.shape
-        rnd_label  = np.zeros((label_h, W, 3), dtype=np.uint8)
-        mppi_label = np.zeros((label_h, W, 3), dtype=np.uint8)
-        cv2.putText(rnd_label,  "RANDOM",    (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-        cv2.putText(mppi_label, "MPPI-SAFE", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 220, 100), 1)
-        rnd_col  = np.vstack([rnd_label,  rnd_f])
-        mppi_col = np.vstack([mppi_label, mppi_f])
-        divider  = np.ones((H + label_h, 4, 3), dtype=np.uint8) * 200
-        side_frames.append(np.hstack([rnd_col, divider, mppi_col]))
+        noreg_f = noreg_frames[i]
+        reg_f   = reg_frames[i]
+        H, W, _ = noreg_f.shape
+        noreg_label = np.zeros((label_h, W, 3), dtype=np.uint8)
+        reg_label   = np.zeros((label_h, W, 3), dtype=np.uint8)
+        cv2.putText(noreg_label, "WITHOUT REG", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+        cv2.putText(reg_label,   "WITH REG",    (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 220, 100), 1)
+        noreg_col = np.vstack([noreg_label, noreg_f])
+        reg_col   = np.vstack([reg_label,   reg_f])
+        divider   = np.ones((H + label_h, 4, 3), dtype=np.uint8) * 200
+        side_frames.append(np.hstack([noreg_col, divider, reg_col]))
 
     imageio.mimsave(str(OUT_DIR / "side_by_side.gif"), side_frames, fps=FPS)
     print(f"  Saved {OUT_DIR}/side_by_side.gif")
@@ -482,39 +479,40 @@ except ImportError:
 
 # ── Comparison plot ────────────────────────────────────────────────────────────
 print("Saving comparison plot...")
-n_rnd  = len(rnd_costs)
-n_mppi = len(mppi_costs)
+n_noreg = len(noreg_costs)
+n_reg   = len(reg_costs)
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
 ax = axes[0, 0]
-ax.plot(np.cumsum(rnd_costs),  color="#E84C4C", label=f"Random   (total={int(rnd_costs.sum())})")
-ax.plot(np.cumsum(mppi_costs), color="#4C9BE8", label=f"MPPI-safe (total={int(mppi_costs.sum())})")
+ax.plot(np.cumsum(noreg_costs), color="#E84C4C", label=f"Without reg (total={int(noreg_costs.sum())})")
+ax.plot(np.cumsum(reg_costs),   color="#4C9BE8", label=f"With reg    (total={int(reg_costs.sum())})")
 ax.set_title("Cumulative Cost"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
 ax.legend()
 
 ax = axes[0, 1]
-ax.plot(rnd_scores,  color="#E84C4C", linewidth=0.7, alpha=0.8, label="Random")
-ax.plot(mppi_scores, color="#4C9BE8", linewidth=0.7, alpha=0.8, label="MPPI-safe")
+ax.plot(noreg_scores, color="#E84C4C", linewidth=0.7, alpha=0.8, label="Without reg")
+ax.plot(reg_scores,   color="#4C9BE8", linewidth=0.7, alpha=0.8, label="With reg")
 ax.axhline(safe_threshold, color="black", linestyle="--", label=f"threshold={safe_threshold:.2f}")
 ax.set_title("Safety Score Over Time"); ax.set_xlabel("Step"); ax.set_ylabel("Score")
 ax.legend()
 
 ax = axes[1, 0]
-ax.fill_between(range(n_rnd),  rnd_costs,  alpha=0.5, color="#E84C4C", label="Random")
-ax.fill_between(range(n_mppi), mppi_costs, alpha=0.5, color="#4C9BE8", label="MPPI-safe")
+ax.fill_between(range(n_noreg), noreg_costs, alpha=0.5, color="#E84C4C", label="Without reg")
+ax.fill_between(range(n_reg),   reg_costs,   alpha=0.5, color="#4C9BE8", label="With reg")
 ax.set_title("Cost Per Step"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
 ax.legend()
 
 ax = axes[1, 1]
-ax.hist(rnd_scores,  bins=40, alpha=0.6, color="#E84C4C", density=True, label="Random")
-ax.hist(mppi_scores, bins=40, alpha=0.6, color="#4C9BE8", density=True, label="MPPI-safe")
+ax.hist(noreg_scores, bins=40, alpha=0.6, color="#E84C4C", density=True, label="Without reg")
+ax.hist(reg_scores,   bins=40, alpha=0.6, color="#4C9BE8", density=True, label="With reg")
 ax.axvline(safe_threshold, color="black", linestyle="--", label="threshold")
 ax.set_title("Safety Score Distribution"); ax.set_xlabel("Score"); ax.set_ylabel("Density")
 ax.legend()
 
 plt.suptitle(
-    f"Random vs MPPI-Safe | seed={best_seed} | Random cost={int(rnd_costs.sum())}  MPPI cost={int(mppi_costs.sum())}",
+    f"Without Regularization vs With Regularization | seed={best_seed} | "
+    f"NoReg cost={int(noreg_costs.sum())}  Reg cost={int(reg_costs.sum())}",
     fontsize=12, fontweight="bold",
 )
 plt.tight_layout()
@@ -523,7 +521,7 @@ plt.close(fig)
 print(f"  Saved {OUT_DIR}/comparison.png")
 
 print(f"\n{'='*50}")
-print(f"Random:    total_cost={int(rnd_costs.sum())}, steps={n_rnd}")
-print(f"MPPI-safe: total_cost={int(mppi_costs.sum())}, steps={n_mppi}")
-cost_red = (rnd_costs.sum() - mppi_costs.sum()) / (rnd_costs.sum() + 1e-8) * 100
-print(f"Cost reduction: {cost_red:.1f}%")
+print(f"Without regularization: total_cost={int(noreg_costs.sum())}, steps={n_noreg}")
+print(f"With regularization:    total_cost={int(reg_costs.sum())}, steps={n_reg}")
+cost_red = (noreg_costs.sum() - reg_costs.sum()) / (noreg_costs.sum() + 1e-8) * 100
+print(f"Cost reduction with regularization: {cost_red:.1f}%")
