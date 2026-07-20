@@ -267,6 +267,9 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     return action, U_warm
 
 
+NUM_HAZARDS = 16  # default is 8; increase for a denser obstacle field
+
+
 def make_viz_env(seed):
     """Separate env with fixedfar overhead camera for recording GIFs."""
     import safety_gymnasium
@@ -277,6 +280,7 @@ def make_viz_env(seed):
         width=256,
         height=256,
     )
+    viz.unwrapped.task.hazards.num = NUM_HAZARDS
     viz.reset(seed=seed)
     return viz
 
@@ -323,10 +327,6 @@ def run_episode(env, use_planner=False, seed=SEED):
             cur_gp = world_to_pixel(live_goal_xy)
             cur_ap = world_to_pixel(live_agent_xy)
 
-            # START marker (fixed, cyan) — where agent spawned
-            draw_marker(frame, sp[0], sp[1], (0, 220, 255), "S", radius=6)
-            # GOAL marker (bright green, slightly larger)
-            draw_marker(frame, cur_gp[0], cur_gp[1], (0, 210, 0), "G", radius=9)
             # Current agent position (yellow dot, small)
             draw_marker(frame, cur_ap[0], cur_ap[1], (50, 200, 255), "", radius=4)
 
@@ -400,6 +400,7 @@ best_goal_dist = 0.0
 for trial_seed in range(SEED, SEED + N_SEARCH):
     env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                                   cfg.frame_skip, seed=trial_seed)
+    env_trial.env.unwrapped.task.hazards.num = NUM_HAZARDS
     # Check initial goal distance and current safety score before running full episode
     env_trial.reset()
     _, _, init_dist = get_agent_goal_pos(env_trial.env)
@@ -435,6 +436,7 @@ rnd_frames, rnd_costs, rnd_scores = best_rnd
 # ── Run MPPI episode with best seed ───────────────────────────────────────────
 env_mppi = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                              cfg.frame_skip, seed=best_seed)
+env_mppi.env.unwrapped.task.hazards.num = NUM_HAZARDS
 
 print(f"\n{'='*50}")
 print(f"Random policy (seed={best_seed}) — total cost: {int(rnd_costs.sum())} | Steps: {len(rnd_costs)}")
