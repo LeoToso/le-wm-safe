@@ -278,7 +278,8 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     return action, U_warm
 
 
-NUM_HAZARDS = 16  # default is 8; increase for a denser obstacle field
+NUM_HAZARDS = 4   # fewer cost-inducing hazard cylinders (default is 8)
+NUM_VASES   = 8   # more pushable obstacle boxes (default is 1)
 
 
 def make_viz_env(seed):
@@ -292,6 +293,7 @@ def make_viz_env(seed):
         height=256,
     )
     viz.unwrapped.task.hazards.num = NUM_HAZARDS
+    viz.unwrapped.task.vases.num   = NUM_VASES
     viz.reset(seed=seed)
     return viz
 
@@ -410,6 +412,7 @@ for trial_seed in range(SEED, SEED + N_SEARCH):
     env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                                   cfg.frame_skip, seed=trial_seed)
     env_trial.env.unwrapped.task.hazards.num = NUM_HAZARDS
+    env_trial.env.unwrapped.task.vases.num   = NUM_VASES
     env_trial.reset()
     _, _, init_dist = get_agent_goal_pos(env_trial.env)
     z0_check = get_z(env_trial._get_stacked_obs() if hasattr(env_trial, '_get_stacked_obs') else env_trial.reset(), model_noreg)
@@ -431,6 +434,7 @@ print(f"Running WITHOUT regularization (rho=0, seed={best_seed})...")
 env_noreg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                               cfg.frame_skip, seed=best_seed)
 env_noreg.env.unwrapped.task.hazards.num = NUM_HAZARDS
+env_noreg.env.unwrapped.task.vases.num   = NUM_VASES
 noreg_frames, noreg_costs, noreg_scores = run_episode(env_noreg, use_planner=True, seed=best_seed, world_model=model_noreg)
 print(f"  Total cost: {int(noreg_costs.sum())} | Steps: {len(noreg_costs)}")
 
@@ -438,6 +442,7 @@ print(f"  Total cost: {int(noreg_costs.sum())} | Steps: {len(noreg_costs)}")
 env_reg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
                             cfg.frame_skip, seed=best_seed)
 env_reg.env.unwrapped.task.hazards.num = NUM_HAZARDS
+env_reg.env.unwrapped.task.vases.num   = NUM_VASES
 
 print(f"\n{'='*50}")
 print(f"Running WITH regularization (rho=1, seed={best_seed})...")
