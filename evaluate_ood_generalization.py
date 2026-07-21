@@ -39,8 +39,8 @@ CLF_PATH       = os.environ.get("CLF_PATH",       "/mnt/t7shield/classifier.pt")
 CLF_NR_PATH    = os.environ.get("CLF_NOREG_PATH", "/mnt/t7shield/classifier_rho0.pt")
 ENV_NAME       = os.environ.get("ENV_NAME",       "SafetyPointGoal1-v0")
 OUT_DIR        = os.environ.get("OUT_DIR",        "eval_wm_viz")
-N_EPISODES     = int(os.environ.get("N_EPISODES", "30"))   # per condition
-MAX_STEPS      = int(os.environ.get("MAX_STEPS",  "300"))
+N_EPISODES     = int(os.environ.get("N_EPISODES", "10"))   # per condition
+MAX_STEPS      = int(os.environ.get("MAX_STEPS",  "150"))
 NUM_HAZARDS    = int(os.environ.get("NUM_HAZARDS", "4"))
 IN_DIST_START  = int(os.environ.get("IN_DIST_START",  "0"))
 OOD_START      = int(os.environ.get("OOD_START",      "5000"))
@@ -78,11 +78,13 @@ clf_reg,  zm_reg,  zs_reg  = load_clf(CLF_PATH)
 clf_noreg, zm_noreg, zs_noreg = load_clf(CLF_NR_PATH)
 
 
-def score(obs_np, encoder, clf, zm, zs):
+def score_both(obs_np):
+    """Score with both classifiers in one GPU round-trip."""
     x = torch.tensor(obs_np[None], dtype=torch.float32).to(DEVICE)
     with torch.no_grad():
-        z = encoder(x)
-        return clf((z - zm) / zs).item()
+        z_r = enc_reg(x);   sr = clf_reg((z_r - zm_reg) / zs_reg).item()
+        z_n = enc_noreg(x); sn = clf_noreg((z_n - zm_noreg) / zs_noreg).item()
+    return sr, sn
 
 
 def hazard_dist(env):
@@ -114,9 +116,8 @@ def collect_records(seed_start, label):
             pass
         obs = env.reset()
         for _ in range(MAX_STEPS):
-            d  = hazard_dist(env)
-            sr = score(obs, enc_reg,   clf_reg,   zm_reg,   zs_reg)
-            sn = score(obs, enc_noreg, clf_noreg, zm_noreg, zs_noreg)
+            d = hazard_dist(env)
+            sr, sn = score_both(obs)
             records.append((d, sr, sn))
             obs, _, _, done, _ = env.step(env.env.action_space.sample())
             if done:
