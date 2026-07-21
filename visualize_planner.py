@@ -27,9 +27,11 @@ from safe_lewm.classifier import ObstacleMLP
 from safe_lewm.env_utils import SafetyGymWrapper
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHECKPOINT    = os.environ.get("CHECKPOINT",       "/mnt/t7shield/safe_lewm_rho1.pt")
+CHECKPOINT       = os.environ.get("CHECKPOINT",       "/mnt/t7shield/safe_lewm_rho1.pt")
 CHECKPOINT_NOREG = os.environ.get("CHECKPOINT_NOREG", "/mnt/t7shield/safe_lewm_rho0.pt")
-CLF_PATH      = os.environ.get("CLF_PATH",    "/mnt/t7shield/classifier.pt")
+CLF_PATH         = os.environ.get("CLF_PATH",         "/mnt/t7shield/classifier.pt")
+CLF_NOREG_PATH   = os.environ.get("CLF_NOREG_PATH",   "")   # optional: separate classifier for rho=0 model
+ENV_NAME         = os.environ.get("ENV_NAME",         "SafetyPointGoal2-v0")
 OUT_DIR       = Path(os.environ.get("OUT_DIR", "planner_viz"))
 MAX_STEPS     = int(os.environ.get("MAX_STEPS",  "500"))
 N_SAMPLES     = int(os.environ.get("N_SAMPLES",  "64"))
@@ -110,19 +112,28 @@ model_noreg.eval()
 for p in model_noreg.parameters():
     p.requires_grad_(False)
 
-# ── Load classifier ───────────────────────────────────────────────────────────
-print("Loading classifier...")
-ckpt = torch.load(CLF_PATH, map_location=DEVICE, weights_only=False)
-clf = ObstacleMLP(
-    z_dim=ckpt["z_dim"], hidden_dim=ckpt["hidden_dim"],
-    depth=ckpt["depth"], dropout=ckpt.get("dropout", 0.1),
-).to(DEVICE)
-clf.load_state_dict(ckpt["classifier_state"])
-clf.eval()
-z_mean = ckpt["z_mean"].to(DEVICE)
-z_std  = ckpt["z_std"].to(DEVICE)
-safe_threshold = ckpt["safe_threshold"]
+# ── Load classifier(s) ────────────────────────────────────────────────────────
+def load_clf(path):
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    c = ObstacleMLP(
+        z_dim=ckpt["z_dim"], hidden_dim=ckpt["hidden_dim"],
+        depth=ckpt["depth"], dropout=ckpt.get("dropout", 0.1),
+    ).to(DEVICE)
+    c.load_state_dict(ckpt["classifier_state"])
+    c.eval()
+    return c, ckpt["z_mean"].to(DEVICE), ckpt["z_std"].to(DEVICE), ckpt["safe_threshold"]
+
+print("Loading classifier (with regularization)...")
+clf, z_mean, z_std, safe_threshold = load_clf(CLF_PATH)
 print(f"  Conformal threshold: {safe_threshold:.4f}")
+
+if CLF_NOREG_PATH:
+    print("Loading classifier (without regularization)...")
+    clf_noreg, z_mean_noreg, z_std_noreg, safe_threshold_noreg = load_clf(CLF_NOREG_PATH)
+    print(f"  Conformal threshold (noreg): {safe_threshold_noreg:.4f}")
+else:
+    print("  CLF_NOREG_PATH not set — using shared classifier for both models")
+    clf_noreg, z_mean_noreg, z_std_noreg, safe_threshold_noreg = clf, z_mean, z_std, safe_threshold
 
 
 def get_z(obs_np, world_model=None):
@@ -133,11 +144,14 @@ def get_z(obs_np, world_model=None):
         return m.encoder(x).squeeze(0)
 
 
-def get_safety_score(z):
+def get_safety_score(z, classifier=None, zm=None, zs=None):
     """(D,) → scalar safety score (higher = safer)."""
-    z_n = (z.unsqueeze(0) - z_mean) / z_std
+    c  = classifier if classifier is not None else clf
+    zm = zm if zm is not None else z_mean
+    zs = zs if zs is not None else z_std
+    z_n = (z.unsqueeze(0) - zm) / zs
     with torch.no_grad():
-        return clf(z_n).item()
+        return c(z_n).item()
 
 
 def get_agent_goal_pos(raw_env):
@@ -214,7 +228,7 @@ def get_goal_direction(raw_env, wrapper=None):
     return (action / norm if norm > 1.0 else action), dist
 
 
-def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0, goal_dist=999.0, world_model=None):
+def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_cost=0, goal_dist=999.0, world_model=None, classifier=None, zm=None, zs=None, thr=None):
     """
     Reactive-predictive safe-goal controller:
       - SAFE: go straight to goal (PD action from get_goal_direction).
@@ -252,13 +266,18 @@ def safe_goal_step(z_hist_deque, U_warm, goal_dir_action, current_score, recent_
     U_b  = (U_warm.unsqueeze(0) + noise).clamp(-1, 1)
     U_b[:N // 2] = (goal_t.unsqueeze(0).unsqueeze(0) + noise[:N // 2]).clamp(-1, 1)
 
-    m = world_model if world_model is not None else model
+    m   = world_model if world_model is not None else model
+    c   = classifier if classifier is not None else clf
+    _zm = zm if zm is not None else z_mean
+    _zs = zs if zs is not None else z_std
+    _thr = thr if thr is not None else safe_threshold
+
     z_seq    = m.rollout(z_h, U_b, HISTORY)
     z_rolled = z_seq[:, -HORIZON:, :].reshape(N * HORIZON, -1)
-    z_flat_n = (z_rolled - z_mean) / z_std
-    scores   = clf(z_flat_n)
+    z_flat_n = (z_rolled - _zm) / _zs
+    scores   = c(z_flat_n)
 
-    pen         = F.softplus(safe_threshold + SAFETY_MARGIN - scores)
+    pen         = F.softplus(_thr + SAFETY_MARGIN - scores)
     safety_cost = pen.reshape(N, HORIZON).sum(-1)
 
     # Goal-attraction cost: prefer escape paths that stay near the goal direction.
@@ -286,7 +305,7 @@ def make_viz_env(seed):
     """Separate env with fixedfar overhead camera for recording GIFs."""
     import safety_gymnasium
     viz = safety_gymnasium.make(
-        cfg.env_name,
+        ENV_NAME,
         render_mode="rgb_array",
         camera_name="fixedfar",
         width=256,
@@ -298,7 +317,7 @@ def make_viz_env(seed):
     return viz
 
 
-def run_episode(env, use_planner=False, seed=SEED, world_model=None):
+def run_episode(env, use_planner=False, seed=SEED, world_model=None, classifier=None, zm=None, zs=None, thr=None):
     """Run one episode; return (frames, costs, scores)."""
     obs = env.reset()
     viz_env = make_viz_env(seed)
@@ -326,7 +345,7 @@ def run_episode(env, use_planner=False, seed=SEED, world_model=None):
     prev_cost = 0  # cost from previous env.step; used as reactive MPPI trigger
     for step in range(MAX_STEPS):
         z_cur = get_z(obs, world_model)
-        score = get_safety_score(z_cur)
+        score = get_safety_score(z_cur, classifier, zm, zs)
         goal_dir, goal_dist = get_goal_direction(env.env)
 
         # High-res overhead frame
@@ -343,8 +362,9 @@ def run_episode(env, use_planner=False, seed=SEED, world_model=None):
             # Current agent position (yellow dot, small)
             draw_marker(frame, cur_ap[0], cur_ap[1], (50, 200, 255), "", radius=4)
 
-            safe_str = "SAFE" if score >= safe_threshold else "UNSAFE"
-            color    = (0, 220, 0) if score >= safe_threshold else (255, 50, 50)
+            _thr_disp = thr if thr is not None else safe_threshold
+            safe_str = "SAFE" if score >= _thr_disp else "UNSAFE"
+            color    = (0, 220, 0) if score >= _thr_disp else (255, 50, 50)
             cv2.putText(frame, f"t={step:3d}",          (6, 18),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.putText(frame, safe_str,                 (6, 36),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color,           2)
             cv2.putText(frame, f"goal:{goal_dist:.1f}m", (6, 54),  cv2.FONT_HERSHEY_SIMPLEX, 0.45,(220, 220, 80),  1)
@@ -357,7 +377,7 @@ def run_episode(env, use_planner=False, seed=SEED, world_model=None):
         # Choose action
         if use_planner:
             with torch.no_grad():
-                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost, goal_dist, world_model)
+                action, U_warm = safe_goal_step(z_hist_deque, U_warm, goal_dir, score, prev_cost, goal_dist, world_model, classifier, zm, zs, thr)
             action_np = action.cpu().numpy()
             # Debug every 10 steps
             if step % 5 == 0:
@@ -408,7 +428,7 @@ EVAL_SEEDS = int(os.environ.get("EVAL_SEEDS", "20"))
 GIF_SEED   = SEED  # seed used for GIF recording (first one)
 
 def make_env(seed):
-    e = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=seed)
+    e = SafetyGymWrapper(ENV_NAME, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=seed)
     e.env.unwrapped.task.hazards.num = NUM_HAZARDS
     e.env.unwrapped.task.vases.num   = NUM_VASES
     return e
@@ -426,12 +446,16 @@ for i, seed in enumerate(range(SEED, SEED + EVAL_SEEDS)):
     print(f"  [{i+1:2d}/{EVAL_SEEDS}] seed={seed}", end="  ", flush=True)
 
     env_nr = make_env(seed)
-    nr_frames, nr_costs, nr_scores = run_episode(env_nr, use_planner=True, seed=seed, world_model=model_noreg)
+    nr_frames, nr_costs, nr_scores = run_episode(env_nr, use_planner=True, seed=seed,
+        world_model=model_noreg, classifier=clf_noreg,
+        zm=z_mean_noreg, zs=z_std_noreg, thr=safe_threshold_noreg)
     noreg_total_costs.append(int(nr_costs.sum()))
     noreg_all_scores.extend(nr_scores.tolist())
 
     env_r = make_env(seed)
-    r_frames, r_costs, r_scores = run_episode(env_r, use_planner=True, seed=seed, world_model=model)
+    r_frames, r_costs, r_scores = run_episode(env_r, use_planner=True, seed=seed,
+        world_model=model, classifier=clf,
+        zm=z_mean, zs=z_std, thr=safe_threshold)
     reg_total_costs.append(int(r_costs.sum()))
     reg_all_scores.extend(r_scores.tolist())
 
@@ -516,7 +540,8 @@ ax.set_title(f"Cost Distribution ({EVAL_SEEDS} seeds)"); ax.set_ylabel("Total Co
 ax = axes[1, 0]
 ax.hist(noreg_all_scores, bins=60, alpha=0.6, color="#E84C4C", density=True, label="Without reg")
 ax.hist(reg_all_scores,   bins=60, alpha=0.6, color="#4C9BE8", density=True, label="With reg")
-ax.axvline(safe_threshold, color="black", linestyle="--", label=f"threshold={safe_threshold:.2f}")
+ax.axvline(safe_threshold_noreg, color="#E84C4C", linestyle="--", alpha=0.7, label=f"thr noreg={safe_threshold_noreg:.2f}")
+ax.axvline(safe_threshold,       color="#4C9BE8", linestyle="--", alpha=0.7, label=f"thr reg={safe_threshold:.2f}")
 ax.set_title("Safety Score Distribution (all seeds)"); ax.set_xlabel("Score"); ax.set_ylabel("Density")
 ax.legend()
 
