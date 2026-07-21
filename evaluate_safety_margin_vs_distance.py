@@ -109,7 +109,7 @@ for ep in range(N_EPISODES):
         env.env.unwrapped.task.hazards.num = NUM_HAZARDS
     except Exception:
         pass
-    obs, _ = env.reset(seed=ep)
+    obs = env.reset()
 
     for step in range(MAX_STEPS):
         dist = get_hazard_distance(env)
@@ -118,7 +118,8 @@ for ep in range(N_EPISODES):
         records.append((dist, score_reg, score_noreg))
 
         action = env.env.action_space.sample()
-        obs, _, terminated, truncated, _ = env.step(action)
+        obs, _, _, done, _ = env.step(action)
+        terminated = truncated = done
         if terminated or truncated:
             break
 
