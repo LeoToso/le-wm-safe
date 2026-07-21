@@ -130,7 +130,7 @@ for ep in range(N_EPISODES):
         if terminated or truncated:
             break
 
-    env.close()
+    env.env.close()
     if (ep + 1) % 5 == 0:
         print(f"  Episode {ep+1}/{N_EPISODES} done  ({len(records)} samples collected)")
 
