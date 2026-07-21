@@ -403,130 +403,138 @@ def run_episode(env, use_planner=False, seed=SEED, world_model=None):
     return frames, np.array(costs), np.array(scores)
 
 
-# ── Search for a good seed (goal starts far, agent spawns safely) ──────────────
-print(f"\nSearching for good seed (initial goal_dist>1.5m, safe spawn) ...")
-best_seed    = SEED
-best_goal_dist = 0.0
+# ── Multi-seed evaluation ──────────────────────────────────────────────────────
+EVAL_SEEDS = int(os.environ.get("EVAL_SEEDS", "20"))
+GIF_SEED   = SEED  # seed used for GIF recording (first one)
 
-for trial_seed in range(SEED, SEED + N_SEARCH):
-    env_trial = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
-                                  cfg.frame_skip, seed=trial_seed)
-    env_trial.env.unwrapped.task.hazards.num = NUM_HAZARDS
-    env_trial.env.unwrapped.task.vases.num   = NUM_VASES
-    env_trial.reset()
-    _, _, init_dist = get_agent_goal_pos(env_trial.env)
-    z0_check = get_z(env_trial._get_stacked_obs() if hasattr(env_trial, '_get_stacked_obs') else env_trial.reset(), model_noreg)
-    init_safety = get_safety_score(z0_check)
-    print(f"  seed={trial_seed}: goal_dist={init_dist:.2f}m, init_safety={init_safety:.2f}")
+def make_env(seed):
+    e = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=seed)
+    e.env.unwrapped.task.hazards.num = NUM_HAZARDS
+    e.env.unwrapped.task.vases.num   = NUM_VASES
+    return e
 
-    starts_safe = init_safety > 1.0
-    starts_far  = init_dist  > 1.5
-    if starts_safe and starts_far:
-        best_seed      = trial_seed
-        best_goal_dist = init_dist
-        break
+print(f"\nEvaluating {EVAL_SEEDS} seeds (SEED {SEED} … {SEED + EVAL_SEEDS - 1}) ...")
+print(f"GIFs will be recorded for seed={GIF_SEED}\n")
 
-print(f"\nUsing seed={best_seed}, initial goal_dist={best_goal_dist:.2f}m")
+noreg_total_costs, reg_total_costs = [], []
+noreg_all_scores,  reg_all_scores  = [], []
+gif_noreg_frames = gif_noreg_costs = gif_noreg_scores = None
+gif_reg_frames   = gif_reg_costs   = gif_reg_scores   = None
 
-# ── Run without-regularization episode ────────────────────────────────────────
+for i, seed in enumerate(range(SEED, SEED + EVAL_SEEDS)):
+    record_gif = (seed == GIF_SEED)
+    print(f"  [{i+1:2d}/{EVAL_SEEDS}] seed={seed}", end="  ", flush=True)
+
+    env_nr = make_env(seed)
+    nr_frames, nr_costs, nr_scores = run_episode(env_nr, use_planner=True, seed=seed, world_model=model_noreg)
+    noreg_total_costs.append(int(nr_costs.sum()))
+    noreg_all_scores.extend(nr_scores.tolist())
+
+    env_r = make_env(seed)
+    r_frames, r_costs, r_scores = run_episode(env_r, use_planner=True, seed=seed, world_model=model)
+    reg_total_costs.append(int(r_costs.sum()))
+    reg_all_scores.extend(r_scores.tolist())
+
+    print(f"noreg_cost={int(nr_costs.sum()):3d}  reg_cost={int(r_costs.sum()):3d}")
+
+    if record_gif:
+        gif_noreg_frames, gif_noreg_costs, gif_noreg_scores = nr_frames, nr_costs, nr_scores
+        gif_reg_frames,   gif_reg_costs,   gif_reg_scores   = r_frames,  r_costs,  r_scores
+
+noreg_total_costs = np.array(noreg_total_costs)
+reg_total_costs   = np.array(reg_total_costs)
+noreg_all_scores  = np.array(noreg_all_scores)
+reg_all_scores    = np.array(reg_all_scores)
+
 print(f"\n{'='*50}")
-print(f"Running WITHOUT regularization (rho=0, seed={best_seed})...")
-env_noreg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
-                              cfg.frame_skip, seed=best_seed)
-env_noreg.env.unwrapped.task.hazards.num = NUM_HAZARDS
-env_noreg.env.unwrapped.task.vases.num   = NUM_VASES
-noreg_frames, noreg_costs, noreg_scores = run_episode(env_noreg, use_planner=True, seed=best_seed, world_model=model_noreg)
-print(f"  Total cost: {int(noreg_costs.sum())} | Steps: {len(noreg_costs)}")
+print(f"Without regularization — mean cost: {noreg_total_costs.mean():.1f} ± {noreg_total_costs.std():.1f}")
+print(f"With    regularization — mean cost: {reg_total_costs.mean():.1f}   ± {reg_total_costs.std():.1f}")
+cost_red = (noreg_total_costs.mean() - reg_total_costs.mean()) / (noreg_total_costs.mean() + 1e-8) * 100
+print(f"Cost reduction with regularization: {cost_red:.1f}%")
 
-# ── Run with-regularization episode ───────────────────────────────────────────
-env_reg = SafetyGymWrapper(cfg.env_name, cfg.image_size, cfg.frame_stack,
-                            cfg.frame_skip, seed=best_seed)
-env_reg.env.unwrapped.task.hazards.num = NUM_HAZARDS
-env_reg.env.unwrapped.task.vases.num   = NUM_VASES
+# ── Save GIFs (for GIF_SEED) ──────────────────────────────────────────────────
+if gif_noreg_frames is not None:
+    try:
+        import imageio
+        import cv2
+        print("\nSaving GIFs...")
 
-print(f"\n{'='*50}")
-print(f"Running WITH regularization (rho=1, seed={best_seed})...")
-reg_frames, reg_costs, reg_scores = run_episode(env_reg, use_planner=True, seed=best_seed, world_model=model)
+        imageio.mimsave(str(OUT_DIR / "noreg_traj.gif"), gif_noreg_frames, fps=FPS)
+        imageio.mimsave(str(OUT_DIR / "reg_traj.gif"),   gif_reg_frames,   fps=FPS)
+        print(f"  Saved {OUT_DIR}/noreg_traj.gif")
+        print(f"  Saved {OUT_DIR}/reg_traj.gif")
 
-# ── Save GIFs ─────────────────────────────────────────────────────────────────
-try:
-    import imageio
-    import cv2
-    print("\nSaving GIFs...")
+        n = min(len(gif_noreg_frames), len(gif_reg_frames))
+        label_h = 22
+        side_frames = []
+        for i in range(n):
+            noreg_f = gif_noreg_frames[i]
+            reg_f   = gif_reg_frames[i]
+            H, W, _ = noreg_f.shape
+            noreg_label = np.zeros((label_h, W, 3), dtype=np.uint8)
+            reg_label   = np.zeros((label_h, W, 3), dtype=np.uint8)
+            cv2.putText(noreg_label, "WITHOUT REG", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+            cv2.putText(reg_label,   "WITH REG",    (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 220, 100), 1)
+            noreg_col = np.vstack([noreg_label, noreg_f])
+            reg_col   = np.vstack([reg_label,   reg_f])
+            divider   = np.ones((H + label_h, 4, 3), dtype=np.uint8) * 200
+            side_frames.append(np.hstack([noreg_col, divider, reg_col]))
 
-    imageio.mimsave(str(OUT_DIR / "noreg_traj.gif"), noreg_frames, fps=FPS)
-    imageio.mimsave(str(OUT_DIR / "reg_traj.gif"),   reg_frames,   fps=FPS)
-    print(f"  Saved {OUT_DIR}/noreg_traj.gif")
-    print(f"  Saved {OUT_DIR}/reg_traj.gif")
+        imageio.mimsave(str(OUT_DIR / "side_by_side.gif"), side_frames, fps=FPS)
+        print(f"  Saved {OUT_DIR}/side_by_side.gif")
+    except ImportError:
+        print("  imageio not found — skipping GIFs")
 
-    # Side-by-side GIF
-    n = min(len(noreg_frames), len(reg_frames))
-    label_h = 22
-    side_frames = []
-    for i in range(n):
-        noreg_f = noreg_frames[i]
-        reg_f   = reg_frames[i]
-        H, W, _ = noreg_f.shape
-        noreg_label = np.zeros((label_h, W, 3), dtype=np.uint8)
-        reg_label   = np.zeros((label_h, W, 3), dtype=np.uint8)
-        cv2.putText(noreg_label, "WITHOUT REG", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
-        cv2.putText(reg_label,   "WITH REG",    (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 220, 100), 1)
-        noreg_col = np.vstack([noreg_label, noreg_f])
-        reg_col   = np.vstack([reg_label,   reg_f])
-        divider   = np.ones((H + label_h, 4, 3), dtype=np.uint8) * 200
-        side_frames.append(np.hstack([noreg_col, divider, reg_col]))
-
-    imageio.mimsave(str(OUT_DIR / "side_by_side.gif"), side_frames, fps=FPS)
-    print(f"  Saved {OUT_DIR}/side_by_side.gif")
-
-except ImportError:
-    print("  imageio not found — skipping GIFs")
-
-# ── Comparison plot ────────────────────────────────────────────────────────────
+# ── Aggregate comparison plot ──────────────────────────────────────────────────
 print("Saving comparison plot...")
-n_noreg = len(noreg_costs)
-n_reg   = len(reg_costs)
+seeds_x = np.arange(EVAL_SEEDS)
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
+# Per-seed bar chart
 ax = axes[0, 0]
-ax.plot(np.cumsum(noreg_costs), color="#E84C4C", label=f"Without reg (total={int(noreg_costs.sum())})")
-ax.plot(np.cumsum(reg_costs),   color="#4C9BE8", label=f"With reg    (total={int(reg_costs.sum())})")
-ax.set_title("Cumulative Cost"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
-ax.legend()
+w = 0.35
+ax.bar(seeds_x - w/2, noreg_total_costs, w, color="#E84C4C", alpha=0.8, label="Without reg")
+ax.bar(seeds_x + w/2, reg_total_costs,   w, color="#4C9BE8", alpha=0.8, label="With reg")
+ax.axhline(noreg_total_costs.mean(), color="#E84C4C", linestyle="--", linewidth=1.5, label=f"No-reg mean={noreg_total_costs.mean():.1f}")
+ax.axhline(reg_total_costs.mean(),   color="#4C9BE8", linestyle="--", linewidth=1.5, label=f"Reg mean={reg_total_costs.mean():.1f}")
+ax.set_xticks(seeds_x); ax.set_xticklabels([str(SEED + i) for i in range(EVAL_SEEDS)], rotation=45, fontsize=7)
+ax.set_title("Total Cost per Seed"); ax.set_xlabel("Seed"); ax.set_ylabel("Total Cost")
+ax.legend(fontsize=8)
 
+# Box plot
 ax = axes[0, 1]
-ax.plot(noreg_scores, color="#E84C4C", linewidth=0.7, alpha=0.8, label="Without reg")
-ax.plot(reg_scores,   color="#4C9BE8", linewidth=0.7, alpha=0.8, label="With reg")
-ax.axhline(safe_threshold, color="black", linestyle="--", label=f"threshold={safe_threshold:.2f}")
-ax.set_title("Safety Score Over Time"); ax.set_xlabel("Step"); ax.set_ylabel("Score")
-ax.legend()
+bp = ax.boxplot([noreg_total_costs, reg_total_costs],
+                labels=["Without reg", "With reg"],
+                patch_artist=True,
+                medianprops=dict(color="white", linewidth=2))
+bp["boxes"][0].set_facecolor("#E84C4C"); bp["boxes"][0].set_alpha(0.7)
+bp["boxes"][1].set_facecolor("#4C9BE8"); bp["boxes"][1].set_alpha(0.7)
+ax.set_title(f"Cost Distribution ({EVAL_SEEDS} seeds)"); ax.set_ylabel("Total Cost")
 
+# Safety score distributions
 ax = axes[1, 0]
-ax.fill_between(range(n_noreg), noreg_costs, alpha=0.5, color="#E84C4C", label="Without reg")
-ax.fill_between(range(n_reg),   reg_costs,   alpha=0.5, color="#4C9BE8", label="With reg")
-ax.set_title("Cost Per Step"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
+ax.hist(noreg_all_scores, bins=60, alpha=0.6, color="#E84C4C", density=True, label="Without reg")
+ax.hist(reg_all_scores,   bins=60, alpha=0.6, color="#4C9BE8", density=True, label="With reg")
+ax.axvline(safe_threshold, color="black", linestyle="--", label=f"threshold={safe_threshold:.2f}")
+ax.set_title("Safety Score Distribution (all seeds)"); ax.set_xlabel("Score"); ax.set_ylabel("Density")
 ax.legend()
 
+# Cumulative cost for GIF seed
 ax = axes[1, 1]
-ax.hist(noreg_scores, bins=40, alpha=0.6, color="#E84C4C", density=True, label="Without reg")
-ax.hist(reg_scores,   bins=40, alpha=0.6, color="#4C9BE8", density=True, label="With reg")
-ax.axvline(safe_threshold, color="black", linestyle="--", label="threshold")
-ax.set_title("Safety Score Distribution"); ax.set_xlabel("Score"); ax.set_ylabel("Density")
+if gif_noreg_costs is not None:
+    ax.plot(np.cumsum(gif_noreg_costs), color="#E84C4C", label=f"Without reg (seed={GIF_SEED}, total={int(gif_noreg_costs.sum())})")
+    ax.plot(np.cumsum(gif_reg_costs),   color="#4C9BE8", label=f"With reg    (seed={GIF_SEED}, total={int(gif_reg_costs.sum())})")
+ax.set_title(f"Cumulative Cost (seed={GIF_SEED})"); ax.set_xlabel("Step"); ax.set_ylabel("Cost")
 ax.legend()
 
 plt.suptitle(
-    f"Without Regularization vs With Regularization | seed={best_seed} | "
-    f"NoReg cost={int(noreg_costs.sum())}  Reg cost={int(reg_costs.sum())}",
-    fontsize=12, fontweight="bold",
+    f"Without Regularization vs With Regularization | {EVAL_SEEDS} seeds | "
+    f"NoReg mean={noreg_total_costs.mean():.1f}  Reg mean={reg_total_costs.mean():.1f}  "
+    f"({cost_red:+.1f}%)",
+    fontsize=11, fontweight="bold",
 )
 plt.tight_layout()
 fig.savefig(OUT_DIR / "comparison.png", dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"  Saved {OUT_DIR}/comparison.png")
-
-print(f"\n{'='*50}")
-print(f"Without regularization: total_cost={int(noreg_costs.sum())}, steps={n_noreg}")
-print(f"With regularization:    total_cost={int(reg_costs.sum())}, steps={n_reg}")
-cost_red = (noreg_costs.sum() - reg_costs.sum()) / (noreg_costs.sum() + 1e-8) * 100
-print(f"Cost reduction with regularization: {cost_red:.1f}%")
