@@ -82,21 +82,28 @@ def get_score(obs_np, encoder, clf, zm, zs):
 
 def get_hazard_distance(env):
     """Return distance to the nearest hazard from the agent's current position."""
-    raw = env.env.unwrapped
-    agent_pos = raw.data.xpos[raw.model.body('agent').id][:2]
-    hazard_ids = [raw.model.body(f'hazard{i}').id for i in range(NUM_HAZARDS)
-                  if f'hazard{i}' in [raw.model.body(j).name for j in range(raw.model.nbody)]]
-    if not hazard_ids:
-        # Fallback: search by name prefix
-        hazard_ids = [i for i in range(raw.model.nbody)
-                      if raw.model.body(i).name.startswith('hazard')]
-    if not hazard_ids:
-        return float('inf')
-    dists = []
-    for bid in hazard_ids:
-        hpos = raw.data.xpos[bid][:2]
-        dists.append(np.linalg.norm(agent_pos - hpos))
-    return float(np.min(dists))
+    try:
+        u = env.env.unwrapped.task
+        agent_pos = np.array(u.agent.pos[:2], dtype=np.float64)
+        # u.hazards.pos is a list of (x, y, z) positions for each hazard
+        hazard_positions = u.hazards.pos
+        if len(hazard_positions) == 0:
+            return float('inf')
+        dists = [np.linalg.norm(agent_pos - np.array(h[:2])) for h in hazard_positions]
+        return float(np.min(dists))
+    except Exception:
+        # Fallback via MuJoCo model body names
+        try:
+            u = env.env.unwrapped.task
+            model, data = u.model, u.data
+            agent_pos = np.array(data.xpos[model.body('agent').id][:2])
+            dists = []
+            for i in range(model.nbody):
+                if model.body(i).name.startswith('hazard'):
+                    dists.append(np.linalg.norm(agent_pos - data.xpos[i][:2]))
+            return float(np.min(dists)) if dists else float('inf')
+        except Exception:
+            return float('inf')
 
 
 # ── Collect data ───────────────────────────────────────────────────────────────
