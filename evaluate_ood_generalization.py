@@ -184,14 +184,20 @@ fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 fig.suptitle("OOD Generalization: Score vs Hazard Distance\n"
              "In-distribution (solid) vs Novel hazard layouts (dashed)", fontsize=12)
 
+# Colors: in-dist = solid, OOD = dashed; ρ=1 = blue/teal, ρ=0 = red/orange
+C_R_IN  = "#2166ac"   # blue       — ρ=1 in-dist
+C_R_OOD = "#74add1"   # light blue — ρ=1 OOD
+C_N_IN  = "#d73027"   # red        — ρ=0 in-dist
+C_N_OOD = "#f46d43"   # orange     — ρ=0 OOD
+
 # --- Panel 1: ρ=1 in-dist vs OOD ---
 ax = axes[0]
 v = ~np.isnan(mr_in)
-ax.plot(bc[v], mr_in[v],  "b-o",  markersize=4, label="ρ=1 in-dist")
-ax.fill_between(bc[v], mr_in[v]-sr_in[v], mr_in[v]+sr_in[v], alpha=0.2, color="blue")
+ax.plot(bc[v], mr_in[v],  "-o",  color=C_R_IN,  markersize=4, label="ρ=1 in-dist")
+ax.fill_between(bc[v], mr_in[v]-sr_in[v], mr_in[v]+sr_in[v], alpha=0.2, color=C_R_IN)
 v2 = ~np.isnan(mr_ood)
-ax.plot(bc[v2], mr_ood[v2], "b--o", markersize=4, label="ρ=1 OOD")
-ax.fill_between(bc[v2], mr_ood[v2]-sr_ood[v2], mr_ood[v2]+sr_ood[v2], alpha=0.15, color="blue")
+ax.plot(bc[v2], mr_ood[v2], "--o", color=C_R_OOD, markersize=4, label="ρ=1 OOD (novel)")
+ax.fill_between(bc[v2], mr_ood[v2]-sr_ood[v2], mr_ood[v2]+sr_ood[v2], alpha=0.15, color=C_R_OOD)
 ax.axhline(0, color="k", linestyle="--", linewidth=1)
 ax.set_title("ρ=1 (with regularization)\nIn-dist vs OOD")
 ax.set_xlabel("Distance to nearest hazard (m)")
@@ -201,11 +207,11 @@ ax.legend(fontsize=9); ax.grid(True, alpha=0.3); ax.invert_xaxis()
 # --- Panel 2: ρ=0 in-dist vs OOD ---
 ax = axes[1]
 v = ~np.isnan(mn_in)
-ax.plot(bc[v], mn_in[v],  "r-o",  markersize=4, label="ρ=0 in-dist")
-ax.fill_between(bc[v], mn_in[v]-sn_in[v], mn_in[v]+sn_in[v], alpha=0.2, color="red")
+ax.plot(bc[v], mn_in[v],  "-o",  color=C_N_IN,  markersize=4, label="ρ=0 in-dist")
+ax.fill_between(bc[v], mn_in[v]-sn_in[v], mn_in[v]+sn_in[v], alpha=0.2, color=C_N_IN)
 v2 = ~np.isnan(mn_ood)
-ax.plot(bc[v2], mn_ood[v2], "r--o", markersize=4, label="ρ=0 OOD")
-ax.fill_between(bc[v2], mn_ood[v2]-sn_ood[v2], mn_ood[v2]+sn_ood[v2], alpha=0.15, color="red")
+ax.plot(bc[v2], mn_ood[v2], "--o", color=C_N_OOD, markersize=4, label="ρ=0 OOD (novel)")
+ax.fill_between(bc[v2], mn_ood[v2]-sn_ood[v2], mn_ood[v2]+sn_ood[v2], alpha=0.15, color=C_N_OOD)
 ax.axhline(0, color="k", linestyle="--", linewidth=1)
 ax.set_title("ρ=0 (no regularization)\nIn-dist vs OOD")
 ax.set_xlabel("Distance to nearest hazard (m)")
@@ -214,8 +220,8 @@ ax.legend(fontsize=9); ax.grid(True, alpha=0.3); ax.invert_xaxis()
 # --- Panel 3: OOD score std comparison (key metric) ---
 ax = axes[2]
 v = ~(np.isnan(sr_ood) | np.isnan(sn_ood))
-ax.plot(bc[v], sr_ood[v], "b-o", markersize=4, label="ρ=1 std (OOD)")
-ax.plot(bc[v], sn_ood[v], "r-o", markersize=4, label="ρ=0 std (OOD)")
+ax.plot(bc[v], sr_ood[v], "-o", color=C_R_IN,  markersize=4, label="ρ=1 std (OOD)")
+ax.plot(bc[v], sn_ood[v], "-o", color=C_N_IN,  markersize=4, label="ρ=0 std (OOD)")
 ax.set_title("Score Std on OOD Layouts\n(lower = more reliable warning signal)")
 ax.set_xlabel("Distance to nearest hazard (m)")
 ax.set_ylabel("Score std (uncertainty)")
