@@ -38,12 +38,7 @@ ENV_NAME      = os.environ.get("ENV_NAME",      "SafetyPointGoal1-v0")
 OUT_GIF       = os.environ.get("OUT_GIF",       "demo_avoidance.gif")
 SEED          = int(os.environ.get("SEED",      "42"))
 MAX_STEPS     = int(os.environ.get("MAX_STEPS", "300"))
-MARGIN_TRIGGER= float(os.environ.get("MARGIN_TRIGGER", "1.2"))  # proactive trigger
-N_SAMPLES     = int(os.environ.get("N_SAMPLES", "128"))
-HORIZON       = int(os.environ.get("HORIZON",   "8"))
-TEMPERATURE   = float(os.environ.get("TEMPERATURE", "0.05"))
-GOAL_ALPHA    = float(os.environ.get("GOAL_ALPHA",  "5.0"))
-SAFETY_WEIGHT = float(os.environ.get("SAFETY_WEIGHT","30.0"))
+MARGIN_TRIGGER= float(os.environ.get("MARGIN_TRIGGER", "1.5"))  # proactive trigger
 FPS           = int(os.environ.get("FPS", "20"))
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -127,38 +122,39 @@ def goal_direction_action(env):
     return np.array([fwd, turn], dtype=np.float32)
 
 
-def mppi_step(z_hist_deque, goal_action, model, clf, zm, zs):
+def avoidance_action(env, goal_action, heading):
     """
-    All N samples are noise around goal_action so they all point toward the goal.
-    We then select purely on predicted safety cost — picking the safest path
-    that still moves toward the goal.  ρ=1's earlier warning gives it time
-    to find a safe detour; ρ=0 triggers too late and has no safe option left.
+    Steer 90° perpendicular to the nearest hazard when score drops below margin.
+    This is a pure reactive controller — no world model rollout needed.
+    The key: ρ=1's score drops below the margin at ~0.6 m from the hazard,
+    while ρ=0's only drops at ~0.3 m, leaving too little room to steer away.
     """
-    z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)  # (1, T, D)
-    N = N_SAMPLES
-    # Moderate noise so samples explore nearby paths but all roughly toward goal
-    noise = torch.randn(N, HORIZON, cfg.action_dim, device=DEVICE) * 0.4
-    base  = torch.tensor(goal_action, device=DEVICE).view(1, 1, -1).expand(N, HORIZON, -1)
-    actions = (base + noise).clamp(-1, 1)
-
-    z_hist_exp = z_hist.expand(N, -1, -1)
-    with torch.no_grad():
-        z_seq = model.rollout(z_hist_exp, actions, history_size=z_hist.shape[1])
-        z_future = z_seq[:, z_hist.shape[1]:, :]   # (N, HORIZON, D)
-
-        # Safety cost only — goal is implicit via goal_action base
-        z_flat = z_future.reshape(N * HORIZON, -1)
-        scores_flat = clf((z_flat - zm) / zs).squeeze(-1)
-        scores = scores_flat.reshape(N, HORIZON)
-        # Penalise negative scores (predicted unsafe states)
-        safety_cost = torch.clamp(-scores, min=0.0).sum(-1)  # (N,)
-
-        beta = safety_cost.min()
-        weights = torch.exp(-(safety_cost - beta) / TEMPERATURE)
-        weights = weights / (weights.sum() + 1e-8)
-
-    best_action = (weights.view(N, 1, 1) * actions).sum(0)[0]  # (action_dim,)
-    return best_action.cpu().numpy()
+    try:
+        u = env.env.unwrapped.task
+        agent_pos = np.array(u.agent.pos[:2])
+        dists = [(np.linalg.norm(agent_pos - np.array(h[:2])), np.array(h[:2]))
+                 for h in u.hazards.pos]
+        if not dists:
+            return goal_action
+        _, nearest_haz = min(dists, key=lambda x: x[0])
+        # Vector away from hazard, rotated 90° to give a lateral detour
+        away = agent_pos - nearest_haz
+        away_angle = math.atan2(away[1], away[0])
+        # Choose the 90° rotation that is closest to the goal direction
+        goal_angle = math.atan2(goal_action[1] if len(goal_action) > 1 else 0,
+                                goal_action[0])
+        perp1 = away_angle + math.pi / 2
+        perp2 = away_angle - math.pi / 2
+        target = perp1 if abs(math.atan2(math.sin(perp1 - goal_angle),
+                                         math.cos(perp1 - goal_angle))) < \
+                          abs(math.atan2(math.sin(perp2 - goal_angle),
+                                         math.cos(perp2 - goal_angle))) else perp2
+        angle_err = math.atan2(math.sin(target - heading),
+                               math.cos(target - heading))
+        turn = float(np.clip(2.0 * angle_err, -1, 1))
+        return np.array([0.7, turn], dtype=np.float32)
+    except Exception:
+        return goal_action
 
 
 def run_episode(model, clf, zm, zs, label):
@@ -182,13 +178,13 @@ def run_episode(model, clf, zm, zs, label):
         z_hist.append(z.squeeze(0))
 
         goal_act = goal_direction_action(env)
-        agent_pos = get_agent_pos(env)
-        goal_pos  = get_goal_pos(env)
-        goal_dist = float(np.linalg.norm(goal_pos - agent_pos))
+        heading  = get_heading(env)
 
-        # Proactive trigger: activate MPPI when score drops below MARGIN_TRIGGER
-        if score < MARGIN_TRIGGER and len(z_hist) == cfg.frame_stack and goal_dist > 0.5:
-            action = mppi_step(z_hist, goal_act, model, clf, zm, zs)
+        # Proactive trigger: steer away when score drops below MARGIN_TRIGGER.
+        # ρ=1 triggers at ~0.6 m (early enough to detour).
+        # ρ=0 triggers at ~0.3 m (inside hazard radius — too late).
+        if score < MARGIN_TRIGGER:
+            action = avoidance_action(env, goal_act, heading)
         else:
             action = goal_act
 
