@@ -36,7 +36,7 @@ CLF_PATH      = os.environ.get("CLF_PATH",      "/mnt/t7shield/classifier.pt")
 CLF_NR_PATH   = os.environ.get("CLF_NOREG_PATH","/mnt/t7shield/classifier_rho0.pt")
 ENV_NAME      = os.environ.get("ENV_NAME",      "SafetyPointGoal1-v0")
 OUT_GIF       = os.environ.get("OUT_GIF",       "demo_avoidance.gif")
-SEED          = int(os.environ.get("SEED",      "7"))
+SEED          = int(os.environ.get("SEED",      "42"))
 MAX_STEPS     = int(os.environ.get("MAX_STEPS", "300"))
 MARGIN_TRIGGER= float(os.environ.get("MARGIN_TRIGGER", "1.2"))  # proactive trigger
 N_SAMPLES     = int(os.environ.get("N_SAMPLES", "128"))
@@ -128,9 +128,16 @@ def goal_direction_action(env):
 
 
 def mppi_step(z_hist_deque, goal_action, model, clf, zm, zs):
+    """
+    All N samples are noise around goal_action so they all point toward the goal.
+    We then select purely on predicted safety cost — picking the safest path
+    that still moves toward the goal.  ρ=1's earlier warning gives it time
+    to find a safe detour; ρ=0 triggers too late and has no safe option left.
+    """
     z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)  # (1, T, D)
     N = N_SAMPLES
-    noise = torch.randn(N, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
+    # Moderate noise so samples explore nearby paths but all roughly toward goal
+    noise = torch.randn(N, HORIZON, cfg.action_dim, device=DEVICE) * 0.4
     base  = torch.tensor(goal_action, device=DEVICE).view(1, 1, -1).expand(N, HORIZON, -1)
     actions = (base + noise).clamp(-1, 1)
 
@@ -139,20 +146,15 @@ def mppi_step(z_hist_deque, goal_action, model, clf, zm, zs):
         z_seq = model.rollout(z_hist_exp, actions, history_size=z_hist.shape[1])
         z_future = z_seq[:, z_hist.shape[1]:, :]   # (N, HORIZON, D)
 
-        # Safety penalty
+        # Safety cost only — goal is implicit via goal_action base
         z_flat = z_future.reshape(N * HORIZON, -1)
         scores_flat = clf((z_flat - zm) / zs).squeeze(-1)
         scores = scores_flat.reshape(N, HORIZON)
-        pen = torch.clamp(-scores, min=0.0)
-        safety_cost = SAFETY_WEIGHT * pen.sum(-1)
+        # Penalise negative scores (predicted unsafe states)
+        safety_cost = torch.clamp(-scores, min=0.0).sum(-1)  # (N,)
 
-        # Goal cost: distance from last predicted z to z of goal direction
-        z_goal_hint = z_hist[:, -1, :].expand(N, -1)
-        goal_cost = GOAL_ALPHA * (z_future[:, -1, :] - z_goal_hint).pow(2).sum(-1)
-
-        total = safety_cost + goal_cost
-        beta = total.min()
-        weights = torch.exp(-(total - beta) / TEMPERATURE)
+        beta = safety_cost.min()
+        weights = torch.exp(-(safety_cost - beta) / TEMPERATURE)
         weights = weights / (weights.sum() + 1e-8)
 
     best_action = (weights.view(N, 1, 1) * actions).sum(0)[0]  # (action_dim,)
