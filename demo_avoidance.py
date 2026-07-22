@@ -128,7 +128,7 @@ def goal_direction_action(env):
 
 
 def mppi_step(z_hist_deque, goal_action, model, clf, zm, zs):
-    z_hist = torch.stack(list(z_hist_deque), dim=1)  # (1, T, D)
+    z_hist = torch.stack(list(z_hist_deque), dim=0).unsqueeze(0)  # (1, T, D)
     N = N_SAMPLES
     noise = torch.randn(N, HORIZON, cfg.action_dim, device=DEVICE) * 0.5
     base  = torch.tensor(goal_action, device=DEVICE).view(1, 1, -1).expand(N, HORIZON, -1)
