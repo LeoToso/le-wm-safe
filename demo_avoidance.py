@@ -161,12 +161,6 @@ def mppi_step(z_hist_deque, goal_action, model, clf, zm, zs):
 
 def run_episode(model, clf, zm, zs, label):
     env = SafetyGymWrapper(ENV_NAME, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=SEED)
-    # Single hazard, no vases
-    try:
-        env.env.unwrapped.task.hazards.num = 1
-        env.env.unwrapped.task.vases.num   = 0
-    except Exception:
-        pass
     obs = env.reset()
 
     z_hist = deque(maxlen=cfg.frame_stack)
