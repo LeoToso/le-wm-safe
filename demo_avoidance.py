@@ -36,7 +36,7 @@ CLF_PATH      = os.environ.get("CLF_PATH",      "/mnt/t7shield/classifier.pt")
 CLF_NR_PATH   = os.environ.get("CLF_NOREG_PATH","/mnt/t7shield/classifier_rho0.pt")
 ENV_NAME      = os.environ.get("ENV_NAME",      "SafetyPointGoal1-v0")
 OUT_GIF       = os.environ.get("OUT_GIF",       "demo_avoidance.gif")
-SEED          = int(os.environ.get("SEED",      "42"))
+SEED          = int(os.environ.get("SEED",      "5007"))  # OOD seed (not seen during training)
 MAX_STEPS     = int(os.environ.get("MAX_STEPS", "300"))
 MARGIN_TRIGGER= float(os.environ.get("MARGIN_TRIGGER", "1.5"))  # proactive trigger
 FPS           = int(os.environ.get("FPS", "20"))
@@ -237,8 +237,8 @@ def add_title(frame, title):
 
 gif_frames = []
 for fr, fn in zip(frames_reg, frames_noreg):
-    fr = add_title(fr, "WITH reg (rho=1) — avoids hazard")
-    fn = add_title(fn, "NO reg  (rho=0) — collides")
+    fr = add_title(fr, f"rho=1 (OOD seed={SEED})  reliable avoidance")
+    fn = add_title(fn, f"rho=0 (OOD seed={SEED})  erratic signal")
     combined = np.concatenate([fr, fn], axis=1)  # (256, 512, 3)
     gif_frames.append(combined)
 
