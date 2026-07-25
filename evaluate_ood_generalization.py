@@ -39,8 +39,8 @@ CLF_PATH       = os.environ.get("CLF_PATH",       "/mnt/t7shield/classifier.pt")
 CLF_NR_PATH    = os.environ.get("CLF_NOREG_PATH", "/mnt/t7shield/classifier_rho0.pt")
 ENV_NAME       = os.environ.get("ENV_NAME",       "SafetyPointGoal1-v0")
 OUT_DIR        = os.environ.get("OUT_DIR",        "eval_wm_viz")
-N_EPISODES     = int(os.environ.get("N_EPISODES", "10"))   # per condition
-MAX_STEPS      = int(os.environ.get("MAX_STEPS",  "150"))
+N_EPISODES     = int(os.environ.get("N_EPISODES", "50"))   # per condition
+MAX_STEPS      = int(os.environ.get("MAX_STEPS",  "400"))
 NUM_HAZARDS    = int(os.environ.get("NUM_HAZARDS", "4"))
 IN_DIST_START  = int(os.environ.get("IN_DIST_START",  "0"))
 OOD_START      = int(os.environ.get("OOD_START",      "5000"))
@@ -139,8 +139,12 @@ print(f"OOD steps:      {len(rec_ood)}")
 
 
 # ── Bin by distance and compute mean ± std ────────────────────────────────────
+# Use finer bins at close range (< 1 m) where the key signal is
 MAX_DIST = 3.0
-bins = np.linspace(0, MAX_DIST, 20)
+bins = np.concatenate([
+    np.linspace(0, 1.0, 15),     # fine: 0–1 m  (14 bins, ~0.07 m each)
+    np.linspace(1.0, MAX_DIST, 10)[1:],  # coarse: 1–3 m (9 bins)
+])
 bc   = 0.5 * (bins[:-1] + bins[1:])
 
 
@@ -220,14 +224,29 @@ ax.legend(fontsize=9); ax.grid(True, alpha=0.3); ax.invert_xaxis()
 # --- Panel 3: OOD score std comparison (key metric) ---
 ax = axes[2]
 v = ~(np.isnan(sr_ood) | np.isnan(sn_ood))
-ax.plot(bc[v], sr_ood[v], "-o", color=C_R_IN,  markersize=4, label="ρ=1 std (OOD)")
-ax.plot(bc[v], sn_ood[v], "-o", color=C_N_IN,  markersize=4, label="ρ=0 std (OOD)")
+ax.plot(bc[v], sr_ood[v], "-o", color=C_R_IN, markersize=5, linewidth=2, label="ρ=1 (with reg)")
+ax.plot(bc[v], sn_ood[v], "-o", color=C_N_IN, markersize=5, linewidth=2, label="ρ=0 (no reg)")
+# Shade the gap between the two std curves
+ax.fill_between(bc[v], sr_ood[v], sn_ood[v],
+                where=(sn_ood[v] > sr_ood[v]),
+                alpha=0.2, color="purple",
+                label="ρ=0 excess uncertainty")
+# Annotate the mean std ratio in the close-range zone
+close = bc < 0.8
+if close.any() and not np.isnan(sr_ood[close]).all():
+    ratio = np.nanmean(sn_ood[close]) / np.nanmean(sr_ood[close])
+    ax.text(0.05, 0.92, f"ρ=0 std / ρ=1 std at <0.8 m:\n  ×{ratio:.2f} higher uncertainty",
+            transform=ax.transAxes, fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
 ax.set_title("Score Std on OOD Layouts\n(lower = more reliable warning signal)")
 ax.set_xlabel("Distance to nearest hazard (m)")
 ax.set_ylabel("Score std (uncertainty)")
 ax.legend(fontsize=9); ax.grid(True, alpha=0.3); ax.invert_xaxis()
+ax.set_ylim(bottom=0)
 
 plt.tight_layout()
 out = f"{OUT_DIR}/ood_generalization.png"
 plt.savefig(out, dpi=150)
 print(f"\nPlot saved: {out}")
+np.savez(f"{OUT_DIR}/ood_records.npz", rec_in=rec_in, rec_ood=rec_ood)
+print(f"Raw data saved: {OUT_DIR}/ood_records.npz")
