@@ -43,7 +43,7 @@ FPS           = int(os.environ.get("FPS", "20"))
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 # ──────────────────────────────────────────────────────────────────────────────
 
-print(f"Device: {DEVICE} | MARGIN_TRIGGER={MARGIN_TRIGGER} | HORIZON={HORIZON} | N_SAMPLES={N_SAMPLES}")
+print(f"Device: {DEVICE} | MARGIN_TRIGGER={MARGIN_TRIGGER}")
 
 
 def load_model(ckpt_path):
