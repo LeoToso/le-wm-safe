@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import imageio
 import cv2
+import mujoco
 from collections import deque
 from pathlib import Path
 
@@ -157,6 +158,27 @@ def avoidance_action(env, goal_action, heading):
         return goal_action
 
 
+def topdown_render(env, size=320):
+    """Render a top-down bird's-eye view using a free MuJoCo camera."""
+    try:
+        u = env.env.unwrapped.task
+        renderer = mujoco.Renderer(u.model, height=size, width=size)
+        cam = mujoco.MjvCamera()
+        cam.type   = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.lookat[:] = [0.0, 0.0, 0.0]   # look at arena centre
+        cam.elevation = -90                 # straight down
+        cam.azimuth   = 0
+        cam.distance  = 12.0               # height above scene
+        renderer.update_scene(u.data, camera=cam)
+        frame = renderer.render()           # (H, W, 3) uint8
+        renderer.close()
+        return frame
+    except Exception:
+        # Fallback to default camera
+        frame = env.env.render()
+        return cv2.resize(frame, (size, size))
+
+
 def run_episode(model, clf, zm, zs, label):
     env = SafetyGymWrapper(ENV_NAME, cfg.image_size, cfg.frame_stack, cfg.frame_skip, seed=SEED)
     obs = env.reset()
@@ -167,9 +189,7 @@ def run_episode(model, clf, zm, zs, label):
     scores_hist = []
 
     for step in range(MAX_STEPS):
-        # Render at higher res for the GIF
-        raw_frame = env.env.render()
-        raw_frame = cv2.resize(raw_frame, (256, 256))
+        raw_frame = topdown_render(env)
 
         z = get_z(obs, model)
         score = get_score(z, clf, zm, zs)
@@ -191,17 +211,18 @@ def run_episode(model, clf, zm, zs, label):
         obs, _, cost, done, _ = env.step(action)
         costs.append(int(cost > 0))
 
-        # Overlay: label + score + cost
-        color = (0, 200, 0) if score >= MARGIN_TRIGGER else (0, 80, 255)
-        cv2.putText(raw_frame, label, (8, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(raw_frame, f"score:{score:+.2f}", (8, 44),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-        cv2.putText(raw_frame, f"cost:{sum(costs)}", (8, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 100, 100), 1, cv2.LINE_AA)
-        # Indicator bar: green=safe, blue=planner active
-        bar_color = (0, 200, 0) if score >= MARGIN_TRIGGER else (0, 80, 255)
-        cv2.rectangle(raw_frame, (0, 250), (256, 256), bar_color, -1)
+        # Overlay: label + score + cost  (frame is 320×320)
+        H, W = raw_frame.shape[:2]
+        score_color = (0, 220, 0) if score >= MARGIN_TRIGGER else (0, 80, 255)
+        cv2.putText(raw_frame, label, (8, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(raw_frame, f"score: {score:+.2f}", (8, 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, score_color, 1, cv2.LINE_AA)
+        cv2.putText(raw_frame, f"collisions: {sum(costs)}", (8, 74),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 180, 255), 1, cv2.LINE_AA)
+        # Bottom indicator bar: green=goal-directed, blue=avoidance active
+        bar_color = (0, 180, 0) if score >= MARGIN_TRIGGER else (200, 60, 0)
+        cv2.rectangle(raw_frame, (0, H - 8), (W, H), bar_color, -1)
 
         frames.append(raw_frame)
 
@@ -227,19 +248,9 @@ if len(frames_reg) < n:
 if len(frames_noreg) < n:
     frames_noreg += [frames_noreg[-1]] * (n - len(frames_noreg))
 
-# Add column labels at top
-def add_title(frame, title):
-    f = frame.copy()
-    cv2.rectangle(f, (0, 0), (256, 20), (30, 30, 30), -1)
-    cv2.putText(f, title, (4, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (255, 255, 255), 1, cv2.LINE_AA)
-    return f
-
 gif_frames = []
 for fr, fn in zip(frames_reg, frames_noreg):
-    fr = add_title(fr, f"rho=1 (OOD seed={SEED})  reliable avoidance")
-    fn = add_title(fn, f"rho=0 (OOD seed={SEED})  erratic signal")
-    combined = np.concatenate([fr, fn], axis=1)  # (256, 512, 3)
+    combined = np.concatenate([fr, fn], axis=1)  # (320, 640, 3)
     gif_frames.append(combined)
 
 imageio.mimsave(OUT_GIF, gif_frames, fps=FPS, loop=0)
