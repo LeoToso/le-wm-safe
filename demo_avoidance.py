@@ -159,7 +159,7 @@ def avoidance_action(env, goal_action, heading):
 
 
 _td_renderer = None   # reuse across steps to avoid repeated init overhead
-RENDER_SIZE   = 256   # must match the model's offscreen framebuffer (256)
+RENDER_SIZE   = 200   # must be < offscreen framebuffer (256)
 
 def topdown_render(env):
     """Render a true top-down view with a dedicated mujoco.Renderer instance."""
