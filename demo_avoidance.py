@@ -158,35 +158,52 @@ def avoidance_action(env, goal_action, heading):
         return goal_action
 
 
-_td_renderer = None   # reuse across steps to avoid repeated init overhead
-RENDER_SIZE   = 200   # must be < offscreen framebuffer (256)
+RENDER_SIZE = 256   # output canvas size
+WORLD_HALF  = 3.5  # world units visible from center (±3.5 m)
 
 def topdown_render(env):
-    """Render a true top-down view with a dedicated mujoco.Renderer instance."""
-    global _td_renderer
+    """Draw a clean top-down map: hazards=red, goal=green, agent=blue dot."""
+    canvas = np.ones((RENDER_SIZE, RENDER_SIZE, 3), dtype=np.uint8) * 240  # light grey bg
+    # draw grid lines
+    step = RENDER_SIZE // 8
+    for i in range(0, RENDER_SIZE, step):
+        cv2.line(canvas, (i, 0), (i, RENDER_SIZE), (210, 210, 210), 1)
+        cv2.line(canvas, (0, i), (RENDER_SIZE, i), (210, 210, 210), 1)
+
+    def to_px(xy):
+        """World (x,y) → pixel (col, row). Y-axis flipped so +y is up."""
+        px = int((xy[0] / WORLD_HALF + 1.0) * 0.5 * RENDER_SIZE)
+        py = int((1.0 - (xy[1] / WORLD_HALF + 1.0) * 0.5) * RENDER_SIZE)
+        return (np.clip(px, 0, RENDER_SIZE-1), np.clip(py, 0, RENDER_SIZE-1))
+
+    def world_r_to_px(r):
+        return max(1, int(r / WORLD_HALF * RENDER_SIZE * 0.5))
+
     try:
         task = env.env.unwrapped.task
-        m, d  = task.model, task.data
-        if _td_renderer is None:
-            _td_renderer = mujoco.Renderer(m, height=RENDER_SIZE, width=RENDER_SIZE)
-        # Track agent position so hazards stay in frame
+        # hazards — red filled circles with darker border
+        haz_r = world_r_to_px(getattr(task.hazards, 'size', 0.3))
+        for h in task.hazards.pos:
+            cx, cy = to_px(h[:2])
+            cv2.circle(canvas, (cx, cy), haz_r + 2, (60, 30, 30), -1)
+            cv2.circle(canvas, (cx, cy), haz_r,     (30, 30, 200), -1)
+        # goal — green circle
         try:
-            agent_xy = np.array(task.agent.pos[:2])
+            gpos = np.array(task.goal.pos[:2])
+            gx, gy = to_px(gpos)
+            cv2.circle(canvas, (gx, gy), world_r_to_px(0.3), (30, 180, 30), -1)
+            cv2.circle(canvas, (gx, gy), world_r_to_px(0.3), (0, 100, 0),    2)
         except Exception:
-            agent_xy = np.zeros(2)
-
-        cam = mujoco.MjvCamera()
-        mujoco.mjv_defaultCamera(cam)
-        cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.elevation = -90.0   # straight down
-        cam.azimuth   = 90.0
-        cam.distance  = 6.0     # closer so objects are visible
-        cam.lookat[:] = [agent_xy[0], agent_xy[1], 0.0]
-        _td_renderer.update_scene(d, camera=cam)
-        return _td_renderer.render().copy()
+            pass
+        # agent — white dot with red outline
+        apos = np.array(task.agent.pos[:2])
+        ax, ay = to_px(apos)
+        cv2.circle(canvas, (ax, ay), 8, (0,   0,   180), -1)
+        cv2.circle(canvas, (ax, ay), 8, (255, 255, 255),  2)
     except Exception as e:
-        print(f"[topdown_render] {e}", flush=True)
-        return np.array(env.env.render(), dtype=np.uint8)
+        pass
+
+    return canvas
 
 
 def run_episode(model, clf, zm, zs, label):
