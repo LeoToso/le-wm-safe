@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import imageio
 import cv2
+import mujoco
 from collections import deque
 from pathlib import Path
 
@@ -157,30 +158,29 @@ def avoidance_action(env, goal_action, heading):
         return goal_action
 
 
-_cam_patched = False
+_td_renderer = None   # reuse across steps to avoid repeated init overhead
 
 def topdown_render(env, size=320):
-    """Render a top-down bird's-eye view by patching the env's own renderer camera."""
-    global _cam_patched
-    raw_env = env.env.unwrapped
-    if not _cam_patched:
-        try:
-            # gymnasium's MujocoRenderer exposes default_cam_config
-            mr = raw_env.mujoco_renderer
-            mr.default_cam_config = {
-                "elevation": -90.0,
-                "distance": 12.0,
-                "azimuth": 0.0,
-                "lookat": np.array([0.0, 0.0, 0.0]),
-            }
-            _cam_patched = True
-        except Exception:
-            pass
-    frame = raw_env.render()
-    frame = np.array(frame, dtype=np.uint8)
-    if frame.shape[0] != size or frame.shape[1] != size:
-        frame = cv2.resize(frame, (size, size))
-    return frame
+    """Render a true top-down view with a dedicated mujoco.Renderer instance."""
+    global _td_renderer
+    try:
+        task = env.env.unwrapped.task
+        m, d  = task.model, task.data
+        if _td_renderer is None:
+            _td_renderer = mujoco.Renderer(m, height=size, width=size)
+        cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultCamera(cam)
+        cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.elevation = -90.0   # straight down
+        cam.azimuth   = 90.0
+        cam.distance  = 10.0
+        cam.lookat[:] = [0.0, 0.0, 0.0]
+        _td_renderer.update_scene(d, camera=cam)
+        return _td_renderer.render().copy()
+    except Exception as e:
+        print(f"[topdown_render] {e}", flush=True)
+        frame = env.env.render()
+        return cv2.resize(np.array(frame), (size, size))
 
 
 def run_episode(model, clf, zm, zs, label):
@@ -241,7 +241,7 @@ def run_episode(model, clf, zm, zs, label):
 
 print(f"\nRunning episodes (seed={SEED})...")
 frames_reg,   cost_reg   = run_episode(model_reg,   clf_reg,   zm_r, zs_r, "rho=1 (reg)")
-_cam_patched = False  # reset so the second env gets patched too
+_td_renderer = None   # new env → new model pointer, must recreate renderer
 frames_noreg, cost_noreg = run_episode(model_noreg, clf_noreg, zm_n, zs_n, "rho=0 (no reg)")
 
 # ── Stitch side-by-side ────────────────────────────────────────────────────────
