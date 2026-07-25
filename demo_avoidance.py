@@ -159,15 +159,16 @@ def avoidance_action(env, goal_action, heading):
 
 
 _td_renderer = None   # reuse across steps to avoid repeated init overhead
+RENDER_SIZE   = 256   # must match the model's offscreen framebuffer (256)
 
-def topdown_render(env, size=320):
+def topdown_render(env):
     """Render a true top-down view with a dedicated mujoco.Renderer instance."""
     global _td_renderer
     try:
         task = env.env.unwrapped.task
         m, d  = task.model, task.data
         if _td_renderer is None:
-            _td_renderer = mujoco.Renderer(m, height=size, width=size)
+            _td_renderer = mujoco.Renderer(m, height=RENDER_SIZE, width=RENDER_SIZE)
         cam = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(cam)
         cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
@@ -179,8 +180,7 @@ def topdown_render(env, size=320):
         return _td_renderer.render().copy()
     except Exception as e:
         print(f"[topdown_render] {e}", flush=True)
-        frame = env.env.render()
-        return cv2.resize(np.array(frame), (size, size))
+        return np.array(env.env.render(), dtype=np.uint8)
 
 
 def run_episode(model, clf, zm, zs, label):
@@ -193,7 +193,7 @@ def run_episode(model, clf, zm, zs, label):
     scores_hist = []
 
     for step in range(MAX_STEPS):
-        raw_frame = topdown_render(env)
+        raw_frame = topdown_render(env)  # (256, 256, 3)
 
         z = get_z(obs, model)
         score = get_score(z, clf, zm, zs)
@@ -215,8 +215,8 @@ def run_episode(model, clf, zm, zs, label):
         obs, _, cost, done, _ = env.step(action)
         costs.append(int(cost > 0))
 
-        # Overlay: label + score + cost  (frame is 320×320)
-        H, W = raw_frame.shape[:2]
+        # Overlay: label + score + cost
+        H, W = raw_frame.shape[:2]   # 256×256
         score_color = (0, 220, 0) if score >= MARGIN_TRIGGER else (0, 80, 255)
         cv2.putText(raw_frame, label, (8, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
