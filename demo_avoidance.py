@@ -20,7 +20,6 @@ import numpy as np
 import torch
 import imageio
 import cv2
-import mujoco
 from collections import deque
 from pathlib import Path
 
@@ -158,25 +157,30 @@ def avoidance_action(env, goal_action, heading):
         return goal_action
 
 
+_cam_patched = False
+
 def topdown_render(env, size=320):
-    """Render a top-down bird's-eye view using a free MuJoCo camera."""
-    try:
-        u = env.env.unwrapped.task
-        renderer = mujoco.Renderer(u.model, height=size, width=size)
-        cam = mujoco.MjvCamera()
-        cam.type   = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.lookat[:] = [0.0, 0.0, 0.0]   # look at arena centre
-        cam.elevation = -90                 # straight down
-        cam.azimuth   = 0
-        cam.distance  = 12.0               # height above scene
-        renderer.update_scene(u.data, camera=cam)
-        frame = renderer.render()           # (H, W, 3) uint8
-        renderer.close()
-        return frame
-    except Exception:
-        # Fallback to default camera
-        frame = env.env.render()
-        return cv2.resize(frame, (size, size))
+    """Render a top-down bird's-eye view by patching the env's own renderer camera."""
+    global _cam_patched
+    raw_env = env.env.unwrapped
+    if not _cam_patched:
+        try:
+            # gymnasium's MujocoRenderer exposes default_cam_config
+            mr = raw_env.mujoco_renderer
+            mr.default_cam_config = {
+                "elevation": -90.0,
+                "distance": 12.0,
+                "azimuth": 0.0,
+                "lookat": np.array([0.0, 0.0, 0.0]),
+            }
+            _cam_patched = True
+        except Exception:
+            pass
+    frame = raw_env.render()
+    frame = np.array(frame, dtype=np.uint8)
+    if frame.shape[0] != size or frame.shape[1] != size:
+        frame = cv2.resize(frame, (size, size))
+    return frame
 
 
 def run_episode(model, clf, zm, zs, label):
@@ -235,8 +239,9 @@ def run_episode(model, clf, zm, zs, label):
     return frames, sum(costs)
 
 
-print(f"\nRunning episodes (seed={SEED}, 1 hazard, no vases)...")
+print(f"\nRunning episodes (seed={SEED})...")
 frames_reg,   cost_reg   = run_episode(model_reg,   clf_reg,   zm_r, zs_r, "rho=1 (reg)")
+_cam_patched = False  # reset so the second env gets patched too
 frames_noreg, cost_noreg = run_episode(model_noreg, clf_noreg, zm_n, zs_n, "rho=0 (no reg)")
 
 # ── Stitch side-by-side ────────────────────────────────────────────────────────
