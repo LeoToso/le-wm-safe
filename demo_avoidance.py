@@ -169,13 +169,19 @@ def topdown_render(env):
         m, d  = task.model, task.data
         if _td_renderer is None:
             _td_renderer = mujoco.Renderer(m, height=RENDER_SIZE, width=RENDER_SIZE)
+        # Track agent position so hazards stay in frame
+        try:
+            agent_xy = np.array(task.agent.pos[:2])
+        except Exception:
+            agent_xy = np.zeros(2)
+
         cam = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(cam)
         cam.type      = mujoco.mjtCamera.mjCAMERA_FREE
         cam.elevation = -90.0   # straight down
         cam.azimuth   = 90.0
-        cam.distance  = 10.0
-        cam.lookat[:] = [0.0, 0.0, 0.0]
+        cam.distance  = 6.0     # closer so objects are visible
+        cam.lookat[:] = [agent_xy[0], agent_xy[1], 0.0]
         _td_renderer.update_scene(d, camera=cam)
         return _td_renderer.render().copy()
     except Exception as e:
