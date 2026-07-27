@@ -185,8 +185,8 @@ def topdown_render(env):
         haz_r = world_r_to_px(getattr(task.hazards, 'size', 0.3))
         for h in task.hazards.pos:
             cx, cy = to_px(h[:2])
-            cv2.circle(canvas, (cx, cy), haz_r + 2, (0,  0,  80),  -1)
-            cv2.circle(canvas, (cx, cy), haz_r,     (0,  0,  220), -1)
+            cv2.circle(canvas, (cx, cy), haz_r + 2, (80,  0,  0),  -1)
+            cv2.circle(canvas, (cx, cy), haz_r,     (220, 0,  0),  -1)
         # goal — green circle
         try:
             gpos = np.array(task.goal.pos[:2])
