@@ -198,15 +198,15 @@ def plot_ood_std(ax, rec_ood):
     close = bc < 0.8
     if close.any() and not np.isnan(sr_ood[close]).all():
         ratio = np.nanmean(sn_ood[close]) / max(np.nanmean(sr_ood[close]), 1e-6)
-        ax.text(0.05, 0.92, f"ρ=0 std / ρ=1 std at <0.8 m:\n  ×{ratio:.2f} higher uncertainty",
-                transform=ax.transAxes, fontsize=9,
+        ax.text(0.97, 0.08, f"ρ=0 std / ρ=1 std at <0.8 m:\n×{ratio:.2f} higher uncertainty",
+                transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
 
     ax.set_title("Score Std on OOD Layouts\n(lower = more reliable warning signal)",
                  fontsize=11, fontweight="bold")
     ax.set_xlabel("Distance to nearest hazard (m)", fontsize=10)
     ax.set_ylabel("Score std (uncertainty)", fontsize=10)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.invert_xaxis()
     ax.set_ylim(bottom=0)

@@ -235,8 +235,8 @@ ax.fill_between(bc[v], sr_ood[v], sn_ood[v],
 close = bc < 0.8
 if close.any() and not np.isnan(sr_ood[close]).all():
     ratio = np.nanmean(sn_ood[close]) / np.nanmean(sr_ood[close])
-    ax.text(0.05, 0.92, f"ρ=0 std / ρ=1 std at <0.8 m:\n  ×{ratio:.2f} higher uncertainty",
-            transform=ax.transAxes, fontsize=9,
+    ax.text(0.97, 0.08, f"ρ=0 std / ρ=1 std at <0.8 m:\n×{ratio:.2f} higher uncertainty",
+            transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
 ax.set_title("Score Std on OOD Layouts\n(lower = more reliable warning signal)")
 ax.set_xlabel("Distance to nearest hazard (m)")
