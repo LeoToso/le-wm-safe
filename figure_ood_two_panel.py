@@ -46,7 +46,7 @@ C_OOD = "#74add1"   # light blue — OOD
 # ── Figure ────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
 fig.suptitle("OOD Score: Mean ± Std vs Distance to Nearest Hazard\n"
-             "In-distribution (solid) vs Novel layouts (dashed)",
+             "Novel layouts only",
              fontsize=12)
 
 panel_cfg = [
@@ -56,24 +56,15 @@ panel_cfg = [
 ]
 
 for ax, (m_in, s_in, m_ood, s_ood, title, c_in, c_ood) in zip(axes, panel_cfg):
-    v_in  = ~np.isnan(m_in)
     v_ood = ~np.isnan(m_ood)
 
-    # In-distribution: mean line + std band
-    ax.plot(bc[v_in], m_in[v_in], "-o", color=c_in, markersize=4,
-            linewidth=2, label="In-dist mean")
-    ax.fill_between(bc[v_in],
-                    m_in[v_in] - s_in[v_in],
-                    m_in[v_in] + s_in[v_in],
-                    alpha=0.25, color=c_in, label="In-dist ±1 std")
-
-    # OOD: mean line + std band
-    ax.plot(bc[v_ood], m_ood[v_ood], "--o", color=c_ood, markersize=4,
+    # OOD only: mean line + std band
+    ax.plot(bc[v_ood], m_ood[v_ood], "-o", color=c_in, markersize=4,
             linewidth=2, label="OOD mean")
     ax.fill_between(bc[v_ood],
                     m_ood[v_ood] - s_ood[v_ood],
                     m_ood[v_ood] + s_ood[v_ood],
-                    alpha=0.18, color=c_ood, label="OOD ±1 std")
+                    alpha=0.25, color=c_in, label="OOD ±1 std")
 
     ax.axhline(0, color="k", linestyle="--", linewidth=0.8, alpha=0.5)
     ax.set_title(title, fontsize=11)
