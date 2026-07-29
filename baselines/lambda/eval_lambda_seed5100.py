@@ -59,6 +59,9 @@ agent = LAMBDA(config, logger, obs_space, act_space)
 # Restore only model weights, skip replay buffer
 ckpt_dir = os.path.join(LOG_DIR, "agent_data")
 latest = tf.train.latest_checkpoint(ckpt_dir)
+if latest is None:
+    # No metadata file — point directly at the prefix
+    latest = os.path.join(ckpt_dir, "checkpoint")
 print(f"Latest checkpoint: {latest}")
 
 checkpoint = tf.train.Checkpoint(
@@ -72,7 +75,7 @@ print("Checkpoint restored (model weights only, buffer skipped).")
 
 # ── Build rollout env with fixedfar camera and fixed positions ────────────────
 import safety_gymnasium
-import cv2
+from PIL import Image as PILImage
 from collections import deque
 
 HAZARD_XY = [
@@ -111,7 +114,8 @@ def get_frame(env):
     frame = env.render()
     if frame is None:
         return np.zeros((3, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
-    frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE))
+    frame = np.array(PILImage.fromarray(frame.astype(np.uint8)).resize(
+        (IMAGE_SIZE, IMAGE_SIZE), PILImage.BILINEAR))
     frame = frame.astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
