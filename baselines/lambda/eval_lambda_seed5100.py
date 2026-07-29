@@ -106,7 +106,7 @@ def override_positions(env):
         print(f"  [warn] goal override: {e}")
     try:
         for i, (x, y) in enumerate(HAZARD_XY):
-            task.hazards.hazards_pos[i][:2] = [x, y]
+            task.hazards.pos[i][:2] = [x, y]
     except Exception as e:
         print(f"  [warn] hazard override: {e}")
 
