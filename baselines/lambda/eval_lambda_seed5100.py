@@ -44,7 +44,7 @@ print("Config loaded. observation_type:", config.observation_type)
 # ── Build env just to get observation/action spaces ───────────────────────────
 ref_env = env_wrappers.make_env(
     config.environment, config.episode_length, config.action_repeat, config.seed,
-    config.observation_type, config.image_size
+    config.observation_type
 )
 obs_space = ref_env.observation_space
 act_space = ref_env.action_space
@@ -87,7 +87,7 @@ HAZARD_XY = [
 ]
 GOAL_XY = (0.33311007, 1.04349929)
 
-IMAGE_SIZE = config.image_size
+IMAGE_SIZE = 64
 FRAME_STACK = 4
 ACTION_REPEAT = config.action_repeat
 
